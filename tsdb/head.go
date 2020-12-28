@@ -1119,6 +1119,11 @@ func (h *Head) gc() {
 	}
 
 	// Rebuild symbols and label value indices from what is left in the postings terms.
+	// symMtx ensures that append of symbols and postings is disabled for rebuild time.
+	h.symMtx.Lock()
+	defer h.symMtx.Unlock()
+
+	// Rebuild symbols and label value indices from what is left in the postings terms.
 	symbols := make(map[string]struct{}, len(h.symbols))
 	values := make(map[string]stringset, len(h.values))
 
@@ -1138,12 +1143,8 @@ func (h *Head) gc() {
 		panic(err)
 	}
 
-	h.symMtx.Lock()
-
 	h.symbols = symbols
 	h.values = values
-
-	h.symMtx.Unlock()
 }
 
 // Tombstones returns a new reader over the head's tombstones
