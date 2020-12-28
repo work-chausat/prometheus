@@ -763,9 +763,13 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			// chunks are closed hence the chk.MaxTime >= meta.MaxTime check.
 			//
 			// TODO think how to avoid the typecasting to verify when it is head block.
-			if _, isHeadChunk := chk.Chunk.(*safeChunk); isHeadChunk && chk.MaxTime >= meta.MaxTime {
-				dranges = append(dranges, tombstones.Interval{Mint: meta.MaxTime, Maxt: math.MaxInt64})
-
+			if _, isHeadChunk := chk.Chunk.(*safeChunk); isHeadChunk {
+				if chk.MaxTime >= meta.MaxTime {
+					dranges = append(dranges, tombstones.Interval{Mint: meta.MaxTime, Maxt: math.MaxInt64})
+				}
+				if chk.MinTime < meta.MinTime {
+					dranges = append(dranges, tombstones.Interval{Mint: math.MinInt64, Maxt: meta.MinTime - 1})
+				}
 			} else
 			// Sanity check for disk blocks.
 			// chk.MaxTime == meta.MaxTime shouldn't happen as well, but will brake many users so not checking for that.
