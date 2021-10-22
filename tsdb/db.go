@@ -27,7 +27,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -35,10 +37,13 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 	_ "github.com/prometheus/prometheus/tsdb/goversion"
+	"github.com/prometheus/prometheus/tsdb/index"
+	"github.com/prometheus/prometheus/tsdb/tombstones"
 	"github.com/prometheus/prometheus/tsdb/wal"
 	"golang.org/x/sync/errgroup"
 )
@@ -46,6 +51,11 @@ import (
 // Default duration of a block in milliseconds - 2h.
 const (
 	DefaultBlockDuration = int64(2 * 60 * 60 * 1000)
+)
+
+var (
+	PointsOutOfOrderMode = false
+	DefaultCompactWaterMarkOptions = CompactWaterMarkOptions{Low: 4 << 30 /*4GB*/, High: math.MaxInt64}
 )
 
 // DefaultOptions used for the DB. They are sane for setups using
@@ -58,6 +68,11 @@ var DefaultOptions = &Options{
 	AllowOverlappingBlocks: false,
 	WALCompression:         false,
 	StripeSize:             DefaultStripeSize,
+	CompactWaterMarkOpts:   DefaultCompactWaterMarkOptions,
+}
+
+type CompactWaterMarkOptions struct {
+	Low, High int64
 }
 
 // Options of the DB storage.
@@ -93,6 +108,8 @@ type Options struct {
 
 	// StripeSize is the size in entries of the series hash map. Reducing the size will save memory but impact perfomance.
 	StripeSize int
+
+	CompactWaterMarkOpts CompactWaterMarkOptions
 }
 
 // Appender allows appending a batch of data. It must be completed with a
@@ -136,7 +153,8 @@ type DB struct {
 	mtx    sync.RWMutex
 	blocks []*Block
 
-	head *Head
+	head      *Head
+	memBlocks []*Head
 
 	compactc chan struct{}
 	donec    chan struct{}
@@ -301,25 +319,17 @@ func OpenDBReadOnly(dir string, l log.Logger) (*DBReadOnly, error) {
 // Note that if the read only database is running concurrently with a
 // writable database then writing the WAL to the database directory can race.
 func (db *DBReadOnly) FlushWAL(dir string) error {
-	blockReaders, err := db.Blocks()
-	if err != nil {
-		return errors.Wrap(err, "read blocks")
-	}
-	maxBlockTime := int64(math.MinInt64)
-	if len(blockReaders) > 0 {
-		maxBlockTime = blockReaders[len(blockReaders)-1].Meta().MaxTime
-	}
 	w, err := wal.Open(db.logger, nil, filepath.Join(db.dir, "wal"))
 	if err != nil {
 		return err
 	}
-	head, err := NewHead(nil, db.logger, w, 1, DefaultStripeSize)
+	head, err := NewHead(nil, db.logger, w, 1, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	if err != nil {
 		return err
 	}
 	// Set the min valid time for the ingested wal samples
 	// to be no lower than the maxt of the last block.
-	if err := head.Init(maxBlockTime); err != nil {
+	if err := head.Init(); err != nil {
 		return errors.Wrap(err, "read WAL")
 	}
 	mint := head.MinTime()
@@ -360,7 +370,7 @@ func (db *DBReadOnly) Querier(mint, maxt int64) (Querier, error) {
 		blocks[i] = b
 	}
 
-	head, err := NewHead(nil, db.logger, nil, 1, DefaultStripeSize)
+	head, err := NewHead(nil, db.logger, nil, 1, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -375,13 +385,13 @@ func (db *DBReadOnly) Querier(mint, maxt int64) (Querier, error) {
 		if err != nil {
 			return nil, err
 		}
-		head, err = NewHead(nil, db.logger, w, 1, DefaultStripeSize)
+		head, err = NewHead(nil, db.logger, w, 1, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 		if err != nil {
 			return nil, err
 		}
 		// Set the min valid time for the ingested wal samples
 		// to be no lower than the maxt of the last block.
-		if err := head.Init(maxBlockTime); err != nil {
+		if err := head.Init(); err != nil {
 			return nil, errors.Wrap(err, "read WAL")
 		}
 		// Set the wal to nil to disable all wal operations.
@@ -534,6 +544,10 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		db.lockf = lockf
 	}
 
+	for i := 0; i < len(opts.BlockRanges); i++ {
+		opts.BlockRanges[i] = (opts.BlockRanges[i] / chunkenc.TimeWindowMs) * chunkenc.TimeWindowMs
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	db.compactor, err = NewLeveledCompactor(ctx, r, l, opts.BlockRanges, db.chunkPool)
 	if err != nil {
@@ -556,23 +570,24 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		}
 	}
 
-	db.head, err = NewHead(r, l, wlog, opts.BlockRanges[0], opts.StripeSize)
+	if opts.CompactWaterMarkOpts.High <= 0 || opts.CompactWaterMarkOpts.Low >= opts.CompactWaterMarkOpts.High {
+		return nil, errors.Errorf("can't compact under the watermark, low: %d, high: %d",
+			opts.CompactWaterMarkOpts.Low, opts.CompactWaterMarkOpts.High)
+	}
+	metrics := newHeadMetrics(func() *Head {
+		return db.Head()
+	}, r)
+
+	db.head, err = NewHead(metrics, l, wlog, opts.BlockRanges[0], opts.StripeSize, opts.CompactWaterMarkOpts)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := db.reload(); err != nil {
+	if err := db.Reload(); err != nil {
 		return nil, err
 	}
-	// Set the min valid time for the ingested samples
-	// to be no lower than the maxt of the last block.
-	blocks := db.Blocks()
-	minValidTime := int64(math.MinInt64)
-	if len(blocks) > 0 {
-		minValidTime = blocks[len(blocks)-1].Meta().MaxTime
-	}
 
-	if initErr := db.head.Init(minValidTime); initErr != nil {
+	if initErr := db.head.Init(); initErr != nil {
 		db.head.metrics.walCorruptionsTotal.Inc()
 		level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", initErr)
 		if err := wlog.Repair(initErr); err != nil {
@@ -681,43 +696,87 @@ func (db *DB) Compact() (err error) {
 		if !db.head.compactable() {
 			break
 		}
-		mint := db.head.MinTime()
-		maxt := rangeForTimestamp(mint, db.head.chunkRange)
 
-		// Wrap head into a range that bounds all reads to it.
-		head := &rangeHead{
-			head: db.head,
-			mint: mint,
-			// We remove 1 millisecond from maxt because block
-			// intervals are half-open: [b.MinTime, b.MaxTime). But
-			// chunk intervals are closed: [c.MinTime, c.MaxTime];
-			// so in order to make sure that overlaps are evaluated
-			// consistently, we explicitly remove the last value
-			// from the block interval here.
-			maxt: maxt - 1,
+		toCompact := db.head
+		newHead := &Head{
+			logger:        db.head.logger,
+			chunkRange:    db.head.chunkRange,
+			minTime:       math.MaxInt64,
+			maxTime:       math.MinInt64,
+			baseTime:      getBaseTime(timestamp.FromTime(time.Now())),
+			series:        newStripeSeries(db.opts.StripeSize),
+			values:        map[string]stringset{},
+			symbols:       map[string]struct{}{},
+			postings:      index.NewMemPostings(),
+			tombstones:    tombstones.NewMemTombstones(),
+			deleted:       map[uint64]int{},
+			waterMarkOpts: db.opts.CompactWaterMarkOpts,
+			metrics:       db.head.metrics,
 		}
-		uid, err := db.compactor.Write(db.dir, head, mint, maxt, nil)
-		if err != nil {
+
+		if !atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&db.head)), unsafe.Pointer(db.head), unsafe.Pointer(newHead)) {
+			break
+		}
+
+		toCompact.pendingWriters.Wait()
+
+		db.mtx.Lock()
+		db.memBlocks = append(db.memBlocks, toCompact)
+		db.mtx.Unlock()
+
+		var persistErr, reloadErr tsdb_errors.MultiError
+		mintRange := toCompact.MinTime()
+		maxtRange := rangeForTimestamp(mintRange, toCompact.chunkRange)
+
+		for mintRange < toCompact.MaxTime() {
+			rangeToCompact := &rangeHead{
+				head: toCompact,
+				mint: mintRange,
+				maxt: maxtRange - 1,
+			}
+			if rangeToCompact.maxt > toCompact.MaxTime() {
+				rangeToCompact.maxt = toCompact.MaxTime()
+			}
+
+			uid, err := db.compactor.Write(db.dir, rangeToCompact, rangeToCompact.mint, rangeToCompact.maxt, nil)
+			mintRange = maxtRange
+			maxtRange = rangeForTimestamp(mintRange, toCompact.chunkRange)
+
+			if err != nil {
+				persistErr.Add(err)
+				continue
+			}
+
+			if err := db.Reload(); err != nil {
+				if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
+					reloadErr.Add(errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid))
+					continue
+				}
+				reloadErr.Add(err)
+			}
+		}
+
+		if err := persistErr.Err(); err != nil {
 			return errors.Wrap(err, "persist head block")
 		}
 
+		db.mtx.Lock()
+		for i := len(db.memBlocks) - 1; i >= 0; i-- {
+			if db.memBlocks[i] == toCompact {
+				if i == len(db.memBlocks)-1 {
+					db.memBlocks = db.memBlocks[:i]
+				} else {
+					db.memBlocks = append(db.memBlocks[:i], db.memBlocks[i+1:]...)
+				}
+			}
+		}
+		db.mtx.Unlock()
+
 		runtime.GC()
 
-		if err := db.reload(); err != nil {
-			if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
-				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid)
-			}
+		if err := reloadErr.Err(); err != nil {
 			return errors.Wrap(err, "reload blocks")
 		}
-		if (uid == ulid.ULID{}) {
-			// Compaction resulted in an empty block.
-			// Head truncating during db.reload() depends on the persisted blocks and
-			// in this case no new block will be persisted so manually truncate the head.
-			if err = db.head.Truncate(maxt); err != nil {
-				return errors.Wrap(err, "head truncate failed (in compact)")
-			}
-		}
-		runtime.GC()
 	}
 
 	// Check for compactions of multiple blocks.
@@ -742,13 +801,21 @@ func (db *DB) Compact() (err error) {
 		}
 		runtime.GC()
 
-		if err := db.reload(); err != nil {
+		if err := db.Reload(); err != nil {
 			if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
 				return errors.Wrapf(err, "delete compacted block after failed db reload:%s", uid)
 			}
 			return errors.Wrap(err, "reload blocks")
 		}
 		runtime.GC()
+
+		if db.head.compactable() {
+			select {
+			case db.compactc <- struct{}{}:
+			default:
+			}
+			break
+		}
 	}
 
 	return nil
@@ -767,7 +834,7 @@ func getBlock(allBlocks []*Block, id ulid.ULID) (*Block, bool) {
 
 // reload blocks and trigger head truncation if new blocks appeared.
 // Blocks that are obsolete due to replacement or retention will be deleted.
-func (db *DB) reload() (err error) {
+func (db *DB) Reload() (err error) {
 	defer func() {
 		if err != nil {
 			db.metrics.reloadsFailed.Inc()
@@ -858,9 +925,7 @@ func (db *DB) reload() (err error) {
 		return nil
 	}
 
-	maxt := loadable[len(loadable)-1].Meta().MaxTime
-
-	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
+	return nil
 }
 
 func openBlocks(l log.Logger, dir string, loaded []*Block, chunkPool chunkenc.Pool) (blocks []*Block, corrupted map[ulid.ULID]error, err error) {
@@ -1220,6 +1285,12 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 			blockMetas = append(blockMetas, b.Meta())
 		}
 	}
+	for _, b := range db.memBlocks {
+		if b.OverlapsClosedInterval(mint, maxt) {
+			blocks = append(blocks, b)
+			blockMetas = append(blockMetas, b.Meta())
+		}
+	}
 	if maxt >= db.head.MinTime() {
 		blocks = append(blocks, &rangeHead{
 			head: db.head,
@@ -1315,7 +1386,7 @@ func (db *DB) CleanTombstones() (err error) {
 			newUIDs = append(newUIDs, *uid)
 		}
 	}
-	return errors.Wrap(db.reload(), "reload blocks")
+	return errors.Wrap(db.Reload(), "reload blocks")
 }
 
 func isBlockDir(fi os.FileInfo) bool {

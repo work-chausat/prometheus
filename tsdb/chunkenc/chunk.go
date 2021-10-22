@@ -16,8 +16,13 @@ package chunkenc
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
+)
+
+const (
+	TimeWindowMs = int64(30 * time.Minute / (time.Millisecond / time.Nanosecond))
 )
 
 // Encoding is the identifier for a chunk encoding.
@@ -53,7 +58,7 @@ type Chunk interface {
 
 // Appender adds sample pairs to a chunk.
 type Appender interface {
-	Append(int64, float64)
+	Append(int64, float64) int
 }
 
 // Iterator is a simple iterator that can only get the next value.

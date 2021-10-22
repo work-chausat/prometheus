@@ -134,8 +134,10 @@ type xorAppender struct {
 	trailing uint8
 }
 
-func (a *xorAppender) Append(t int64, v float64) {
+func (a *xorAppender) Append(t int64, v float64) int {
 	var tDelta uint64
+
+	bytesNum := len(a.b.bytes())
 	num := binary.BigEndian.Uint16(a.b.bytes())
 
 	if num == 0 {
@@ -185,6 +187,8 @@ func (a *xorAppender) Append(t int64, v float64) {
 	a.v = v
 	binary.BigEndian.PutUint16(a.b.bytes(), num+1)
 	a.tDelta = tDelta
+
+	return len(a.b.bytes()) - bytesNum
 }
 
 func bitRange(x int64, nbits uint8) bool {

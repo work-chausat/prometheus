@@ -16,7 +16,6 @@ package tsdb
 import (
 	"fmt"
 	"io/ioutil"
-	"math"
 	"math/rand"
 	"os"
 	"path"
@@ -41,7 +40,7 @@ import (
 func BenchmarkCreateSeries(b *testing.B) {
 	series := genSeries(b.N, 10, 0, 0)
 
-	h, err := NewHead(nil, nil, nil, 10000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 10000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(b, err)
 	defer h.Close()
 
@@ -171,9 +170,9 @@ func BenchmarkLoadWAL(b *testing.B) {
 
 				// Load the WAL.
 				for i := 0; i < b.N; i++ {
-					h, err := NewHead(nil, nil, w, 10000, DefaultStripeSize)
+					h, err := NewHead(nil, nil, w, 10000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 					testutil.Ok(b, err)
-					h.Init(0)
+					h.Init()
 				}
 			})
 	}
@@ -218,10 +217,10 @@ func TestHead_ReadWAL(t *testing.T) {
 			defer w.Close()
 			populateTestWAL(t, w, entries)
 
-			head, err := NewHead(nil, nil, w, 10000, DefaultStripeSize)
+			head, err := NewHead(nil, nil, w, 10000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 			testutil.Ok(t, err)
 
-			testutil.Ok(t, head.Init(math.MinInt64))
+			testutil.Ok(t, head.Init())
 			testutil.Equals(t, uint64(101), head.lastSeriesID)
 
 			s10 := head.series.getByID(10)
@@ -259,10 +258,10 @@ func TestHead_WALMultiRef(t *testing.T) {
 	w, err := wal.New(nil, nil, dir, false)
 	testutil.Ok(t, err)
 
-	head, err := NewHead(nil, nil, w, 10000, DefaultStripeSize)
+	head, err := NewHead(nil, nil, w, 10000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 
-	testutil.Ok(t, head.Init(0))
+	testutil.Ok(t, head.Init())
 	app := head.Appender()
 	ref1, err := app.Add(labels.FromStrings("foo", "bar"), 100, 1)
 	testutil.Ok(t, err)
@@ -283,9 +282,9 @@ func TestHead_WALMultiRef(t *testing.T) {
 	w, err = wal.New(nil, nil, dir, false)
 	testutil.Ok(t, err)
 
-	head, err = NewHead(nil, nil, w, 10000, DefaultStripeSize)
+	head, err = NewHead(nil, nil, w, 10000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
-	testutil.Ok(t, head.Init(0))
+	testutil.Ok(t, head.Init())
 	defer head.Close()
 
 	q, err := NewBlockQuerier(head, 0, 300)
@@ -295,7 +294,7 @@ func TestHead_WALMultiRef(t *testing.T) {
 }
 
 func TestHead_Truncate(t *testing.T) {
-	h, err := NewHead(nil, nil, nil, 10000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 10000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -374,7 +373,7 @@ func TestMemSeries_truncateChunks(t *testing.T) {
 	s := newMemSeries(labels.FromStrings("a", "b"), 1, 2000)
 
 	for i := 0; i < 4000; i += 5 {
-		ok, _ := s.append(int64(i), float64(i))
+		ok, _, _ := s.append(int64(i), float64(i))
 		testutil.Assert(t, ok == true, "sample append failed")
 	}
 
@@ -432,10 +431,10 @@ func TestHeadDeleteSeriesWithoutSamples(t *testing.T) {
 			defer w.Close()
 			populateTestWAL(t, w, entries)
 
-			head, err := NewHead(nil, nil, w, 1000, DefaultStripeSize)
+			head, err := NewHead(nil, nil, w, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 			testutil.Ok(t, err)
 
-			testutil.Ok(t, head.Init(math.MinInt64))
+			testutil.Ok(t, head.Init())
 
 			testutil.Ok(t, head.Delete(0, 100, labels.MustNewMatcher(labels.MatchEqual, "a", "1")))
 		})
@@ -506,7 +505,7 @@ func TestHeadDeleteSimple(t *testing.T) {
 				testutil.Ok(t, err)
 				defer w.Close()
 
-				head, err := NewHead(nil, nil, w, 1000, DefaultStripeSize)
+				head, err := NewHead(nil, nil, w, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 				testutil.Ok(t, err)
 				defer head.Close()
 
@@ -536,10 +535,10 @@ func TestHeadDeleteSimple(t *testing.T) {
 				reloadedW, err := wal.New(nil, nil, w.Dir(), compress) // Use a new wal to ensure deleted samples are gone even after a reload.
 				testutil.Ok(t, err)
 				defer reloadedW.Close()
-				reloadedHead, err := NewHead(nil, nil, reloadedW, 1000, DefaultStripeSize)
+				reloadedHead, err := NewHead(nil, nil, reloadedW, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 				testutil.Ok(t, err)
 				defer reloadedHead.Close()
-				testutil.Ok(t, reloadedHead.Init(0))
+				testutil.Ok(t, reloadedHead.Init())
 
 				// Compare the query results for both heads - before and after the reload.
 				expSeriesSet := newMockSeriesSet([]Series{
@@ -585,7 +584,7 @@ func TestHeadDeleteSimple(t *testing.T) {
 
 func TestDeleteUntilCurMax(t *testing.T) {
 	numSamples := int64(10)
-	hb, err := NewHead(nil, nil, nil, 1000000, DefaultStripeSize)
+	hb, err := NewHead(nil, nil, nil, 1000000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer hb.Close()
 	app := hb.Appender()
@@ -636,7 +635,7 @@ func TestDeletedSamplesAndSeriesStillInWALAfterCheckpoint(t *testing.T) {
 
 	// Enough samples to cause a checkpoint.
 	numSamples := 10000
-	hb, err := NewHead(nil, nil, wlog, int64(numSamples)*10, DefaultStripeSize)
+	hb, err := NewHead(nil, nil, wlog, int64(numSamples)*10, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer hb.Close()
 	for i := 0; i < numSamples; i++ {
@@ -730,7 +729,7 @@ func TestDelete_e2e(t *testing.T) {
 	defer func() {
 		testutil.Ok(t, os.RemoveAll(dir))
 	}()
-	hb, err := NewHead(nil, nil, nil, 100000, DefaultStripeSize)
+	hb, err := NewHead(nil, nil, nil, 100000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer hb.Close()
 	app := hb.Appender()
@@ -916,19 +915,19 @@ func TestMemSeries_append(t *testing.T) {
 	// Add first two samples at the very end of a chunk range and the next two
 	// on and after it.
 	// New chunk must correctly be cut at 1000.
-	ok, chunkCreated := s.append(998, 1)
+	ok, chunkCreated, _ := s.append(998, 1)
 	testutil.Assert(t, ok, "append failed")
 	testutil.Assert(t, chunkCreated, "first sample created chunk")
 
-	ok, chunkCreated = s.append(999, 2)
+	ok, chunkCreated, _ = s.append(999, 2)
 	testutil.Assert(t, ok, "append failed")
 	testutil.Assert(t, !chunkCreated, "second sample should use same chunk")
 
-	ok, chunkCreated = s.append(1000, 3)
+	ok, chunkCreated, _ = s.append(1000, 3)
 	testutil.Assert(t, ok, "append failed")
 	testutil.Assert(t, chunkCreated, "expected new chunk on boundary")
 
-	ok, chunkCreated = s.append(1001, 4)
+	ok, chunkCreated, _ = s.append(1001, 4)
 	testutil.Assert(t, ok, "append failed")
 	testutil.Assert(t, !chunkCreated, "second sample should use same chunk")
 
@@ -938,7 +937,7 @@ func TestMemSeries_append(t *testing.T) {
 	// Fill the range [1000,2000) with many samples. Intermediate chunks should be cut
 	// at approximately 120 samples per chunk.
 	for i := 1; i < 1000; i++ {
-		ok, _ := s.append(1001+int64(i), float64(i))
+		ok, _, _ := s.append(1001+int64(i), float64(i))
 		testutil.Assert(t, ok, "append failed")
 	}
 
@@ -952,7 +951,7 @@ func TestMemSeries_append(t *testing.T) {
 
 func TestGCChunkAccess(t *testing.T) {
 	// Put a chunk, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -992,7 +991,7 @@ func TestGCChunkAccess(t *testing.T) {
 
 func TestGCSeriesAccess(t *testing.T) {
 	// Put a series, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -1033,7 +1032,7 @@ func TestGCSeriesAccess(t *testing.T) {
 }
 
 func TestUncommittedSamplesNotLostOnTruncate(t *testing.T) {
-	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -1060,7 +1059,7 @@ func TestUncommittedSamplesNotLostOnTruncate(t *testing.T) {
 }
 
 func TestRemoveSeriesAfterRollbackAndTruncate(t *testing.T) {
-	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -1102,7 +1101,7 @@ func TestHead_LogRollback(t *testing.T) {
 			w, err := wal.New(nil, nil, dir, compress)
 			testutil.Ok(t, err)
 			defer w.Close()
-			h, err := NewHead(nil, nil, w, 1000, DefaultStripeSize)
+			h, err := NewHead(nil, nil, w, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 			testutil.Ok(t, err)
 
 			app := h.Appender()
@@ -1190,10 +1189,10 @@ func TestWalRepair_DecodingError(t *testing.T) {
 						testutil.Ok(t, w.Log(test.rec))
 					}
 
-					h, err := NewHead(nil, nil, w, 1, DefaultStripeSize)
+					h, err := NewHead(nil, nil, w, 1, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 					testutil.Ok(t, err)
 					testutil.Equals(t, 0.0, prom_testutil.ToFloat64(h.metrics.walCorruptionsTotal))
-					initErr := h.Init(math.MinInt64)
+					initErr := h.Init()
 
 					err = errors.Cause(initErr) // So that we can pick up errors even if wrapped.
 					_, corrErr := err.(*wal.CorruptionErr)
@@ -1239,7 +1238,7 @@ func TestNewWalSegmentOnTruncate(t *testing.T) {
 	wlog, err := wal.NewSize(nil, nil, dir, 32768, false)
 	testutil.Ok(t, err)
 
-	h, err := NewHead(nil, nil, wlog, 1000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, wlog, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer h.Close()
 	add := func(ts int64) {
@@ -1276,7 +1275,7 @@ func TestAddDuplicateLabelName(t *testing.T) {
 	wlog, err := wal.NewSize(nil, nil, dir, 32768, false)
 	testutil.Ok(t, err)
 
-	h, err := NewHead(nil, nil, wlog, 1000, DefaultStripeSize)
+	h, err := NewHead(nil, nil, wlog, 1000, DefaultStripeSize, DefaultCompactWaterMarkOptions)
 	testutil.Ok(t, err)
 	defer h.Close()
 
