@@ -62,12 +62,13 @@ var (
 type Head struct {
 	// Keep all 64bit atomically accessed variables at the top of this struct.
 	// See https://golang.org/pkg/sync/atomic/#pkg-note-BUG for more info.
-	chunkRange       int64
-	numSeries        uint64
-	minTime, maxTime int64 // Current min and max of the samples included in the head.
-	minValidTime     int64 // Mint allowed to be added to the head. It shouldn't be lower than the maxt of the last persisted block.
-	lastSeriesID     uint64
-	numBytes         int64
+	chunkRange   int64
+	numSeries    uint64
+	hotMinTime   int64 //
+	hotMaxTime   int64 // Current min and max of the samples included in the head.
+	minValidTime int64 // Mint allowed to be added to the head. It shouldn't be lower than the maxt of the last persisted block.
+	lastSeriesID uint64
+	numBytes     int64
 
 	metrics    *headMetrics
 	wal        *wal.WAL
@@ -95,6 +96,8 @@ type Head struct {
 	lastPostingsStatsCall time.Duration        // last posting stats call (PostingsCardinalityStats()) time for caching
 
 	waterMarkOpts CompactWaterMarkOptions
+
+	compacting *compactRange //range data to flush disk
 }
 
 type headMetrics struct {
@@ -282,8 +285,8 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int
 		wal:           wal,
 		logger:        l,
 		chunkRange:    chunkRange,
-		minTime:       math.MaxInt64,
-		maxTime:       math.MinInt64,
+		hotMinTime:    math.MaxInt64,
+		hotMaxTime:    math.MinInt64,
 		series:        newStripeSeries(stripeSize),
 		values:        map[string]stringset{},
 		symbols:       map[string]struct{}{},
@@ -351,7 +354,7 @@ func (h *Head) updateMinMaxTime(mint, maxt int64) {
 		if mint >= lt {
 			break
 		}
-		if atomic.CompareAndSwapInt64(&h.minTime, lt, mint) {
+		if atomic.CompareAndSwapInt64(&h.hotMinTime, lt, mint) {
 			break
 		}
 	}
@@ -360,7 +363,7 @@ func (h *Head) updateMinMaxTime(mint, maxt int64) {
 		if maxt <= ht {
 			break
 		}
-		if atomic.CompareAndSwapInt64(&h.maxTime, ht, maxt) {
+		if atomic.CompareAndSwapInt64(&h.hotMaxTime, ht, maxt) {
 			break
 		}
 	}
@@ -656,7 +659,12 @@ func (h *Head) Truncate(mint int64) (err error) {
 
 	// Ensure that max time is at least as high as min time.
 	for h.MaxTime() < mint {
-		atomic.CompareAndSwapInt64(&h.maxTime, h.MaxTime(), mint)
+		atomic.CompareAndSwapInt64(&h.hotMaxTime, h.MaxTime(), mint)
+	}
+	if h.compacting != nil && h.compacting.staleMaxTime <= mint {
+		h.compacting = nil
+	} else if h.compacting != nil {
+		atomic.CompareAndSwapInt64(&h.compacting.staleMinTime, h.compacting.staleMinTime, mint)
 	}
 
 	// This was an initial call to Truncate after loading blocks on startup.
@@ -749,13 +757,13 @@ func (h *Head) Truncate(mint int64) (err error) {
 // for a completely fresh head with an empty WAL.
 // Returns true if the initialization took an effect.
 func (h *Head) initTime(t int64) (initialized bool) {
-	if !atomic.CompareAndSwapInt64(&h.minTime, math.MaxInt64, t) {
+	if !atomic.CompareAndSwapInt64(&h.hotMinTime, math.MaxInt64, t) {
 		return false
 	}
 	// Ensure that max time is initialized to at least the min time we just set.
 	// Concurrent appenders may already have set it to a higher value.
-	atomic.CompareAndSwapInt64(&h.maxTime, math.MinInt64, t)
-	atomic.CompareAndSwapInt64(&h.minValidTime, math.MinInt64, getBaseTime(t))
+	atomic.CompareAndSwapInt64(&h.hotMaxTime, math.MinInt64, t)
+	atomic.StoreInt64(&h.minValidTime, getBaseTime(t))
 
 	return true
 }
@@ -855,7 +863,7 @@ func (h *Head) appender() *headAppender {
 		head: h,
 		// Set the minimum valid time to whichever is greater the head min valid time or the compaction window.
 		// This ensures that no samples will be added within the compaction window to avoid races.
-		minValidTime: max(atomic.LoadInt64(&h.minValidTime), getBaseTime(h.maxTime)),
+		minValidTime: max(atomic.LoadInt64(&h.minValidTime), getBaseTime(h.hotMaxTime)),
 		mint:         math.MaxInt64,
 		maxt:         math.MinInt64,
 		samples:      h.getAppendBuffer(),
@@ -865,6 +873,12 @@ func (h *Head) appender() *headAppender {
 
 func max(a, b int64) int64 {
 	if a > b {
+		return a
+	}
+	return b
+}
+func min(a, b int64) int64 {
+	if a < b {
 		return a
 	}
 	return b
@@ -1107,7 +1121,6 @@ func (h *Head) gc(mint int64) {
 	// deleted entirely.
 	deleted, chunksRemoved, bytesRemoved, minTime := h.series.gc(mint)
 	if !initialize {
-		atomic.StoreInt64(&h.minTime, minTime)
 		atomic.StoreInt64(&h.minValidTime, minTime)
 	}
 
@@ -1219,12 +1232,16 @@ func (h *Head) Meta() BlockMeta {
 
 // MinTime returns the lowest time bound on visible data in the head.
 func (h *Head) MinTime() int64 {
-	return atomic.LoadInt64(&h.minTime)
+	if h.compacting == nil {
+		return atomic.LoadInt64(&h.hotMinTime)
+	}
+	return min(atomic.LoadInt64(&h.hotMinTime), atomic.LoadInt64(&h.compacting.staleMinTime))
+
 }
 
 // MaxTime returns the highest timestamp seen in data of the head.
 func (h *Head) MaxTime() int64 {
-	return atomic.LoadInt64(&h.maxTime)
+	return atomic.LoadInt64(&h.hotMaxTime)
 }
 
 // compactable returns whether the head has a compactable range.
@@ -1239,6 +1256,32 @@ func (h *Head) compactable() bool {
 		return false
 	}
 	return h.MaxTime()-h.MinTime() > h.chunkRange/2*3
+}
+
+func (h *Head) compactRange() *compactRange {
+	if h.compacting != nil {
+		return h.compacting
+	}
+	staleMinTime := h.hotMinTime
+	staleMaxTime := (h.hotMaxTime / h.chunkRange) * h.chunkRange
+
+	for {
+		staleMinTime = atomic.LoadInt64(&h.hotMinTime)
+		if atomic.CompareAndSwapInt64(&h.hotMinTime, staleMinTime, staleMaxTime) {
+			break
+		}
+	}
+
+	h.compacting = &compactRange{
+		staleMinTime: staleMinTime,
+		staleMaxTime: staleMaxTime,
+	}
+	return h.compacting
+}
+
+type compactRange struct {
+	staleMinTime int64
+	staleMaxTime int64
 }
 
 // Close flushes the WAL and closes the head.

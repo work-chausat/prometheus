@@ -703,10 +703,12 @@ func (db *DB) Compact() (err error) {
 			break
 		}
 		var persistErr, reloadErr, gcErr tsdb_errors.MultiError
-		mint := db.head.MinTime()
+		compactRange := db.head.compactRange()
+
+		mint := compactRange.staleMinTime
 		maxt := rangeForTimestamp(mint, db.head.chunkRange)
 
-		for ; maxt <= db.head.MaxTime() && db.head.compactable(); mint, maxt = maxt, rangeForTimestamp(maxt, db.head.chunkRange) {
+		for ; db.head.compacting != nil && maxt <= db.head.compacting.staleMaxTime && db.head.compactable(); mint, maxt = maxt, rangeForTimestamp(maxt, db.head.chunkRange) {
 			// Wrap head into a range that bounds all reads to it.
 			head := &rangeHead{
 				head: db.head,
