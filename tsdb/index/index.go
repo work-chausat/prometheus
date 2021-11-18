@@ -1562,7 +1562,8 @@ func (r *Reader) Postings(name string, values ...string) (Postings, error) {
 			for string(v) >= value {
 				if string(v) == value {
 					// Read from the postings table.
-					d2 := encoding.NewDecbufAt(r.b, int(postingsOff), castagnoliTable)
+					//d2 := encoding.NewDecbufAt(r.b, int(postingsOff), castagnoliTable)
+					d2 := encoding.NewDecbufAt(r.b, int(postingsOff), nil)
 					_, p, err := r.dec.Postings(d2.Get())
 					if err != nil {
 						return nil, errors.Wrap(err, "decode postings")
