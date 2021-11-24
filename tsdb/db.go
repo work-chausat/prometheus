@@ -868,25 +868,41 @@ func openBlocks(l log.Logger, dir string, loaded []*Block, chunkPool chunkenc.Po
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "find blocks")
 	}
-
 	corrupted = make(map[ulid.ULID]error)
-	for _, bDir := range bDirs {
-		meta, _, err := readMetaFile(bDir)
-		if err != nil {
-			level.Error(l).Log("msg", "failed to read meta.json for a block", "dir", bDir, "err", err)
-			continue
-		}
+	var wg sync.WaitGroup
+	var rwMutex sync.RWMutex
 
-		// See if we already have the block in memory or open it otherwise.
-		block, open := getBlock(loaded, meta.ULID)
-		if !open {
-			block, err = OpenBlock(l, bDir, chunkPool)
+	for i, blockDir := range bDirs {
+		wg.Add(1)
+		go func(bDir string) {
+			defer wg.Done()
+
+			meta, _, err := readMetaFile(bDir)
 			if err != nil {
-				corrupted[meta.ULID] = err
-				continue
+				level.Error(l).Log("msg", "failed to read meta.json for a block", "dir", bDir, "err", err)
+				return
 			}
+
+			// See if we already have the block in memory or open it otherwise.
+			block, open := getBlock(loaded, meta.ULID)
+			if !open {
+				block, err = OpenBlock(l, bDir, chunkPool)
+				if err != nil {
+					rwMutex.Lock()
+					corrupted[meta.ULID] = err
+					rwMutex.Unlock()
+					return
+				}
+			}
+
+			rwMutex.Lock()
+			blocks = append(blocks, block)
+			rwMutex.Unlock()
+		}(blockDir)
+
+		if i%16 == 0 || i == len(bDirs)-1 {
+			wg.Wait()
 		}
-		blocks = append(blocks, block)
 	}
 	return blocks, corrupted, nil
 }
