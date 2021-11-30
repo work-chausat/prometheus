@@ -124,10 +124,11 @@ type Writer struct {
 	buf1 encoding.Encbuf
 	buf2 encoding.Encbuf
 
-	numSymbols int
-	symbols    *Symbols
-	symbolFile *fileutil.MmapFile
-	lastSymbol string
+	numSymbols   int
+	symbols      *Symbols
+	symbolFile   *fileutil.MmapFile
+	lastSymbol   string
+	originSymbol []string
 
 	labelIndexes []labelIndexHashEntry // Label index offsets.
 	labelNames   map[string]uint64     // Label names, and their usage.
@@ -482,38 +483,44 @@ func (w *Writer) startSymbols() error {
 	// We are at w.toc.Symbols.
 	// Leave 4 bytes of space for the length, and another 4 for the number of symbols
 	// which will both be calculated later.
-	return w.write([]byte("alenblen"))
+	w.originSymbol = make([]string, 0)
+	return nil
 }
 
 func (w *Writer) AddSymbol(sym string) error {
 	if err := w.ensureStage(idxStageSymbols); err != nil {
 		return err
 	}
-	if w.numSymbols != 0 && sym <= w.lastSymbol {
+	if len(w.originSymbol) != 0 && sym <= w.lastSymbol {
 		return errors.Errorf("symbol %q out-of-order", sym)
 	}
+	w.originSymbol = append(w.originSymbol, sym)
 	w.lastSymbol = sym
-	w.numSymbols++
-	w.buf1.Reset()
-	w.buf1.PutUvarintStr(sym)
-	return w.write(w.buf1.Get())
+	return nil
 }
 
 func (w *Writer) finishSymbols() error {
-	// Write out the length and symbol count.
+	if w.f.pos != w.toc.Symbols {
+		return errors.Errorf("current pos[%d] not eq toc[%d]", w.f.pos, w.toc.Symbols)
+	}
 	w.buf1.Reset()
-	w.buf1.PutBE32int(int(w.f.pos - w.toc.Symbols - 4))
-	w.buf1.PutBE32int(int(w.numSymbols))
-	if err := w.writeAt(w.buf1.Get(), w.toc.Symbols); err != nil {
-		return err
+	w.buf1.PutBE32int(len(w.originSymbol))
+	for _, sym := range w.originSymbol {
+		w.buf1.PutUvarintStr(sym)
 	}
 
-	hashPos := w.f.pos
-	// Leave space for the hash. We can only calculate it
-	// now that the number of symbols is known, so mmap and do it from there.
-	if err := w.write([]byte("hash")); err != nil {
-		return err
-	}
+	//crc32
+	w.crc32.Reset()
+	w.buf1.PutHash(w.crc32)
+
+	//space for the length
+	w.buf2.Reset()
+	w.buf2.PutBE32int(len(w.buf1.Get()) - crc32.Size)
+
+	w.write(w.buf2.Get(), w.buf1.Get())
+
+	w.originSymbol = nil
+
 	if err := w.f.Flush(); err != nil {
 		return err
 	}
@@ -523,12 +530,6 @@ func (w *Writer) finishSymbols() error {
 		return err
 	}
 	w.symbolFile = sf
-	hash := crc32.Checksum(w.symbolFile.Bytes()[w.toc.Symbols+4:hashPos], castagnoliTable)
-	w.buf1.Reset()
-	w.buf1.PutBE32(hash)
-	if err := w.writeAt(w.buf1.Get(), hashPos); err != nil {
-		return err
-	}
 
 	// Load in the symbol table efficiently for the rest of the index writing.
 	w.symbols, err = NewSymbols(realByteSlice(w.symbolFile.Bytes()), FormatV2, int(w.toc.Symbols))
@@ -602,92 +603,51 @@ func (w *Writer) writeLabelIndex(name string, values []uint32) error {
 		offset: w.f.pos,
 	})
 
-	startPos := w.f.pos
-	// Leave 4 bytes of space for the length, which will be calculated later.
-	if err := w.write([]byte("alen")); err != nil {
-		return err
-	}
 	w.crc32.Reset()
 
 	w.buf1.Reset()
 	w.buf1.PutBE32int(1) // Number of names.
 	w.buf1.PutBE32int(len(values))
-	w.buf1.WriteToHash(w.crc32)
-	if err := w.write(w.buf1.Get()); err != nil {
-		return err
-	}
-
 	for _, v := range values {
-		w.buf1.Reset()
 		w.buf1.PutBE32(v)
-		w.buf1.WriteToHash(w.crc32)
-		if err := w.write(w.buf1.Get()); err != nil {
-			return err
-		}
 	}
+	//add crc32
+	w.buf1.PutHash(w.crc32)
 
-	// Write out the length.
-	w.buf1.Reset()
-	w.buf1.PutBE32int(int(w.f.pos - startPos - 4))
-	if err := w.writeAt(w.buf1.Get(), startPos); err != nil {
-		return err
-	}
+	//alen
+	w.buf2.Reset()
+	w.buf2.PutBE32int(len(w.buf1.Get()) - crc32.Size)
 
-	w.buf1.Reset()
-	w.buf1.PutHashSum(w.crc32)
-	return w.write(w.buf1.Get())
+	return w.write(w.buf2.Get(), w.buf1.Get())
 }
 
-// writeLabelIndexesOffsetTable writes the label indices offset table.
 func (w *Writer) writeLabelIndexesOffsetTable() error {
-	startPos := w.f.pos
-	// Leave 4 bytes of space for the length, which will be calculated later.
-	if err := w.write([]byte("alen")); err != nil {
-		return err
-	}
-	w.crc32.Reset()
-
 	w.buf1.Reset()
 	w.buf1.PutBE32int(len(w.labelIndexes))
-	w.buf1.WriteToHash(w.crc32)
-	if err := w.write(w.buf1.Get()); err != nil {
-		return err
-	}
-
 	for _, e := range w.labelIndexes {
-		w.buf1.Reset()
 		w.buf1.PutUvarint(len(e.keys))
 		for _, k := range e.keys {
 			w.buf1.PutUvarintStr(k)
 		}
 		w.buf1.PutUvarint64(e.offset)
-		w.buf1.WriteToHash(w.crc32)
-		if err := w.write(w.buf1.Get()); err != nil {
-			return err
-		}
-	}
-	// Write out the length.
-	w.buf1.Reset()
-	w.buf1.PutBE32int(int(w.f.pos - startPos - 4))
-	if err := w.writeAt(w.buf1.Get(), startPos); err != nil {
-		return err
 	}
 
-	w.buf1.Reset()
-	w.buf1.PutHashSum(w.crc32)
-	return w.write(w.buf1.Get())
+	//put crc32
+	w.crc32.Reset()
+	w.buf1.PutHash(w.crc32)
+
+	// Write out the length.
+	w.buf2.Reset()
+	w.buf2.PutBE32int(len(w.buf1.Get()) - crc32.Size)
+
+	return w.write(w.buf2.Get(), w.buf1.Get())
+
 }
 
 // writePostingsOffsetTable writes the postings offset table.
 func (w *Writer) writePostingsOffsetTable() error {
 	// Ensure everything is in the temporary file.
 	if err := w.fPO.Flush(); err != nil {
-		return err
-	}
-
-	startPos := w.f.pos
-	// Leave 4 bytes of space for the length, which will be calculated later.
-	if err := w.write([]byte("alen")); err != nil {
 		return err
 	}
 
@@ -698,10 +658,6 @@ func (w *Writer) writePostingsOffsetTable() error {
 	w.buf1.Reset()
 	w.crc32.Reset()
 	w.buf1.PutBE32int(int(w.cntPO)) // Count.
-	w.buf1.WriteToHash(w.crc32)
-	if err := w.write(w.buf1.Get()); err != nil {
-		return err
-	}
 
 	f, err := fileutil.OpenMmapFile(w.fPO.name)
 	if err != nil {
@@ -715,15 +671,10 @@ func (w *Writer) writePostingsOffsetTable() error {
 	d := encoding.NewDecbufRaw(realByteSlice(f.Bytes()), int(w.fPO.pos))
 	cnt := w.cntPO
 	for d.Err() == nil && cnt > 0 {
-		w.buf1.Reset()
 		w.buf1.PutUvarint(d.Uvarint())                     // Keycount.
 		w.buf1.PutUvarintStr(yoloString(d.UvarintBytes())) // Label name.
 		w.buf1.PutUvarintStr(yoloString(d.UvarintBytes())) // Label value.
 		w.buf1.PutUvarint64(d.Uvarint64() + adjustment)    // Offset.
-		w.buf1.WriteToHash(w.crc32)
-		if err := w.write(w.buf1.Get()); err != nil {
-			return err
-		}
 		cnt--
 	}
 	if d.Err() != nil {
@@ -743,17 +694,14 @@ func (w *Writer) writePostingsOffsetTable() error {
 	}
 	w.fPO = nil
 
-	// Write out the length.
-	w.buf1.Reset()
-	w.buf1.PutBE32int(int(w.f.pos - startPos - 4))
-	if err := w.writeAt(w.buf1.Get(), startPos); err != nil {
-		return err
-	}
+	//crc32
+	w.buf1.PutHash(w.crc32)
 
-	// Finally write the hash.
-	w.buf1.Reset()
-	w.buf1.PutHashSum(w.crc32)
-	return w.write(w.buf1.Get())
+	// Write out the length.
+	w.buf2.Reset()
+	w.buf2.PutBE32int(len(w.buf1.Get()) - crc32.Size)
+
+	return w.write(w.buf2.Get(), w.buf1.Get())
 }
 
 const indexTOCLen = 6*8 + crc32.Size
