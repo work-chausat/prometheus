@@ -686,11 +686,17 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		if err != nil {
 			return errors.Wrapf(err, "open index reader for block %s", b)
 		}
+		if headIndexr, isHeadIndexReader := indexr.(*headIndexReader); isHeadIndexReader {
+			indexr = &compactHeadIndexReader{headIndexReader: headIndexr}
+		}
 		closers = append(closers, indexr)
 
 		chunkr, err := b.Chunks()
 		if err != nil {
 			return errors.Wrapf(err, "open chunk reader for block %s", b)
+		}
+		if headChunkr, isHeadChunkReader := chunkr.(*headChunkReader); isHeadChunkReader {
+			chunkr = &compactHeadChunkReader{headChunkReader: headChunkr}
 		}
 		closers = append(closers, chunkr)
 
@@ -763,7 +769,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			// chunks are closed hence the chk.MaxTime >= meta.MaxTime check.
 			//
 			// TODO think how to avoid the typecasting to verify when it is head block.
-			if _, isHeadChunk := chk.Chunk.(*safeChunk); isHeadChunk {
+			if _, isHeadChunk := chk.Chunk.(*cuttableChunk); isHeadChunk {
 				if chk.MaxTime >= meta.MaxTime {
 					dranges = append(dranges, tombstones.Interval{Mint: meta.MaxTime, Maxt: math.MaxInt64})
 				}
@@ -1048,4 +1054,83 @@ func (m mergedStringIter) Err() error {
 		return m.a.Err()
 	}
 	return m.b.Err()
+}
+
+type compactHeadChunkReader struct {
+	*headChunkReader
+}
+
+func (h *compactHeadChunkReader) Chunk(ref uint64) (chunkenc.Chunk, error) {
+	sid, cid := unpackChunkID(ref)
+
+	s := h.head.series.getByID(sid)
+	// This means that the series has been garbage collected.
+	if s == nil {
+		return nil, ErrNotFound
+	}
+
+	s.Lock()
+	c := s.chunk(int(cid))
+
+	// This means that the chunk has been garbage collected or is outside
+	// the specified range.
+	if c == nil {
+		s.Unlock()
+		return nil, ErrNotFound
+	}
+
+	if c.stale == nil || !c.stale.OverlapsClosedInterval(h.mint, h.maxt) {
+		s.Unlock()
+		return nil, ErrNotFound
+	}
+
+	s.Unlock()
+
+	return c.stale, nil
+}
+
+type compactHeadIndexReader struct {
+	*headIndexReader
+}
+
+func (h *compactHeadIndexReader) Series(ref uint64, lbls *labels.Labels, chks *[]chunks.Meta) error {
+	s := h.head.series.getByID(ref)
+
+	if s == nil {
+		h.head.metrics.seriesNotFound.Inc()
+		return ErrNotFound
+	}
+	*lbls = append((*lbls)[:0], s.lset...)
+
+	s.Lock()
+	defer s.Unlock()
+
+	*chks = (*chks)[:0]
+
+	for i, c := range s.chunks {
+		// Do not expose chunks that are outside of the specified range.
+		if c == nil || !c.OverlapsClosedInterval(h.mint, h.maxt) {
+			continue
+		}
+
+		stale := c.cut(false)
+		if stale == nil || !stale.OverlapsClosedInterval(h.mint, h.maxt) {
+			continue
+		}
+
+		//if !stale.OverlapsClosedInterval(h.mint, h.maxt) && c.OverlapsClosedInterval(h.mint, h.maxt) {
+		//	stale = c.cut(true)
+		//	if stale == nil {
+		//		continue
+		//	}
+		//}
+
+		*chks = append(*chks, chunks.Meta{
+			MinTime: stale.minTime,
+			MaxTime: stale.maxTime,
+			Ref:     packChunkID(s.ref, uint64(s.chunkID(i))),
+		})
+	}
+
+	return nil
 }

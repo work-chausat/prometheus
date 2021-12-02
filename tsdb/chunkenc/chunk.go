@@ -16,8 +16,13 @@ package chunkenc
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
+)
+
+var (
+	TimeWindowMs = int64(15 * time.Minute / (time.Millisecond / time.Nanosecond))
 )
 
 // Encoding is the identifier for a chunk encoding.
@@ -29,6 +34,8 @@ func (e Encoding) String() string {
 		return "none"
 	case EncXOR:
 		return "XOR"
+	case EncUnorderedXOR:
+		return "EncUnorderedXOR"
 	}
 	return "<unknown>"
 }
@@ -37,6 +44,7 @@ func (e Encoding) String() string {
 const (
 	EncNone Encoding = iota
 	EncXOR
+	EncUnorderedXOR
 )
 
 // Chunk holds a sequence of sample pairs that can be iterated over and appended to.
@@ -73,6 +81,77 @@ type nopIterator struct{}
 func (nopIterator) At() (int64, float64) { return 0, 0 }
 func (nopIterator) Next() bool           { return false }
 func (nopIterator) Err() error           { return nil }
+
+func NewMergeIterator(a, b Iterator) Iterator {
+	return &mergeIterator{
+		aIt: a,
+		bIt: b,
+	}
+}
+
+type mergeIterator struct {
+	aIt, bIt              Iterator
+	aok, bok, initialized bool
+
+	curT int64
+	curV float64
+}
+
+func (c *mergeIterator) At() (int64, float64) {
+	return c.curT, c.curV
+}
+
+func (c *mergeIterator) Err() error {
+	if c.aIt.Err() != nil {
+		return c.aIt.Err()
+	}
+	return c.bIt.Err()
+}
+
+func (c *mergeIterator) Next() bool {
+	if !c.initialized {
+		if c.aIt == nil {
+			c.aok = false
+		} else {
+			c.aok = c.aIt.Next()
+		}
+		if c.bIt == nil {
+			c.bok = false
+		} else {
+			c.bok = c.bIt.Next()
+		}
+		c.initialized = true
+	}
+
+	if !c.aok && !c.bok {
+		return false
+	}
+
+	if !c.aok {
+		c.curT, c.curV = c.bIt.At()
+		c.bok = c.bIt.Next()
+		return true
+	}
+	if !c.bok {
+		c.curT, c.curV = c.aIt.At()
+		c.aok = c.aIt.Next()
+		return true
+	}
+	acurT, acurV := c.aIt.At()
+	bcurT, bcurV := c.bIt.At()
+	if acurT < bcurT {
+		c.curT, c.curV = acurT, acurV
+		c.aok = c.aIt.Next()
+	} else if acurT > bcurT {
+		c.curT, c.curV = bcurT, bcurV
+		c.bok = c.bIt.Next()
+	} else {
+		c.curT, c.curV = bcurT, bcurV
+		c.aok = c.aIt.Next()
+		c.bok = c.bIt.Next()
+	}
+	return true
+}
 
 // Pool is used to create and reuse chunk references to avoid allocations.
 type Pool interface {
