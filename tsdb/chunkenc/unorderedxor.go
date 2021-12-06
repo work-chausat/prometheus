@@ -2,7 +2,7 @@ package chunkenc
 
 import "github.com/prometheus/prometheus/tsdb/waterlevel"
 
-const outOfOrderSize = 1<<3 - 1
+const outOfOrderSize = 1<<4 - 1
 
 type UnorderedXORChunk struct {
 	sortedPoints *sortedPoints

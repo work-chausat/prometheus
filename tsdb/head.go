@@ -673,16 +673,13 @@ func (h *Head) Truncate(mint int64) (err error) {
 	}
 
 	h.metrics.headTruncateTotal.Inc()
-	start := time.Now()
 
 	h.gc(mint)
-	level.Info(h.logger).Log("msg", "head GC completed", "duration", time.Since(start))
-	h.metrics.gcDuration.Observe(time.Since(start).Seconds())
 
 	if h.wal == nil {
 		return nil
 	}
-	start = time.Now()
+	start := time.Now()
 
 	first, last, err := h.wal.Segments()
 	if err != nil {
@@ -1114,6 +1111,12 @@ func (h *Head) Delete(mint, maxt int64, ms ...*labels.Matcher) error {
 
 // gc removes data before the minimum timestamp from the head.
 func (h *Head) gc(mint int64) {
+	start := time.Now()
+	defer func() {
+		level.Info(h.logger).Log("msg", "head GC completed", "duration", time.Since(start))
+		h.metrics.gcDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	initialize := h.MinTime() == math.MaxInt64
 
 	// Drop old chunks and remember series IDs and hashes if they can be
@@ -1867,7 +1870,13 @@ func (s *memSeries) gc(mint int64) (chunksRemoved int, baseTime int64) {
 		k = i + 1
 	}
 
-	s.chunks = append(s.chunks[:0], s.chunks[k:]...)
+	if len(s.chunks)*3/2 < cap(s.chunks) {
+		dest := make([]*memChunk, len(s.chunks)-k)
+		copy(dest, s.chunks[k:])
+		s.chunks = dest
+	} else {
+		s.chunks = append(s.chunks[:0], s.chunks[k:]...)
+	}
 	s.firstChunkID += k
 	s.baseTime = deadline
 	if len(s.chunks) == 0 {

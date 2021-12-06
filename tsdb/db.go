@@ -736,9 +736,7 @@ func (db *DB) Compact() (err error) {
 		// Compaction resulted in an empty block.
 		// Head truncating during db.reload() depends on the persisted blocks and
 		// in this case no new block will be persisted so manually truncate the head.
-		if err = db.head.Truncate(maxt); err != nil {
-			return errors.Wrap(err, "head truncate failed (in compact)")
-		}
+		db.head.gc(maxt)
 		runtime.GC()
 	}
 
