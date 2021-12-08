@@ -97,7 +97,7 @@ func (c *UnorderedXORChunk) mergeIter(it Iterator, copyOnWrite bool) Iterator {
 
 	var points []Point
 	if copyOnWrite {
-		points = make([]Point, 0, len(*c.sortedPoints))
+		points = make([]Point, len(*c.sortedPoints))
 		copy(points, *c.sortedPoints)
 	} else {
 		points = *c.sortedPoints
