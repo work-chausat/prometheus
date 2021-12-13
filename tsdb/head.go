@@ -373,6 +373,19 @@ func (h *Head) updateMinMaxTime(mint, maxt int64) {
 	}
 }
 
+func (h *Head) updateMinTime(mint int64) {
+	for {
+		lt := atomic.LoadInt64(&h.minTime)
+		if mint >= lt {
+			break
+		}
+		level.Debug(h.logger).Log("update minTime", "mint", mint)
+		if atomic.CompareAndSwapInt64(&h.minTime, lt, mint) {
+			break
+		}
+	}
+}
+
 func (h *Head) loadWAL(r *wal.Reader, multiRef map[uint64]uint64) (err error) {
 	// Track number of samples that referenced a series we don't know about
 	// for error reporting.
@@ -1121,10 +1134,11 @@ func (h *Head) gc(mint int64) {
 
 	// Drop old chunks and remember series IDs and hashes if they can be
 	// deleted entirely.
-	deleted, chunksRemoved, minTime := h.series.gc(mint)
+	deleted, chunksRemoved, actualMinT := h.series.gc(mint)
 	if !initialize {
 		//atomic.StoreInt64(&h.minTime, minTime)
-		atomic.StoreInt64(&h.minValidTime, minTime)
+		atomic.StoreInt64(&h.minValidTime, actualMinT)
+		h.updateMinTime(actualMinT)
 	}
 
 	seriesRemoved := len(deleted)
@@ -1250,6 +1264,7 @@ func (h *Head) mergeMinTime(err error) int64 {
 	if err != nil {
 		for {
 			if minTime := atomic.LoadInt64(&h.minTime); minTime > h.splittedMinTime {
+				level.Info(h.logger).Log("merge minTime", "mint", h.splittedMinTime, "err", err)
 				if atomic.CompareAndSwapInt64(&h.minTime, minTime, h.splittedMinTime) {
 					break
 				}

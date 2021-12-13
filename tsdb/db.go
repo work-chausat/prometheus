@@ -698,11 +698,7 @@ func (db *DB) Compact() (err error) {
 			return nil
 		default:
 		}
-		if i == 0 {
-			mint = db.head.splitMinTime()
-		} else {
-			mint = maxt
-		}
+		mint = db.head.splitMinTime()
 		maxt = rangeForTimestamp(mint, db.head.chunkRange)
 
 		// Wrap head into a range that bounds all reads to it.
@@ -718,9 +714,8 @@ func (db *DB) Compact() (err error) {
 			maxt: maxt - 1,
 		}
 		uid, err := db.compactor.Write(db.dir, head, mint, maxt, nil)
-		if i == 0 {
-			db.head.mergeMinTime(err)
-		}
+		db.head.mergeMinTime(err)
+
 		if err != nil {
 			return errors.Wrap(err, "persist head block")
 		}
