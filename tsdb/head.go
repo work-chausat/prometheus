@@ -1367,6 +1367,8 @@ type safeChunk struct {
 	*memChunk
 	s   *memSeries
 	cid int
+
+	mergedResult chunkenc.Chunk
 }
 
 func (c *safeChunk) Iterator(reuseIter chunkenc.Iterator) chunkenc.Iterator {
@@ -1377,19 +1379,46 @@ func (c *safeChunk) Iterator(reuseIter chunkenc.Iterator) chunkenc.Iterator {
 }
 
 func (c *safeChunk) Encoding() chunkenc.Encoding {
-	return c.s.encoding
+	return chunkenc.EncXOR
 }
 
 func (c *safeChunk) Appender() (chunkenc.Appender, error) {
-	return c.memChunk.appender(c.Encoding())
+	return nil, errors.New("safe chunk is stale ")
+}
+
+func (c *safeChunk) merge() {
+	if c.mergedResult != nil {
+		return
+	}
+	c.s.Lock()
+	defer c.s.Unlock()
+
+	if c.chunk == nil && c.stale == nil {
+		c.mergedResult = chunkenc.NewXORChunk()
+		return
+	}
+
+	if c.chunk != nil && c.stale == nil {
+		c.mergedResult = c.chunk
+		return
+	}
+	if c.stale != nil && c.chunk == nil {
+		c.mergedResult = c.stale
+		return
+	}
+
+	chk, _ := chunks.MergeChunks(c.stale, c.chunk)
+	c.mergedResult = chk
 }
 
 func (c *safeChunk) Bytes() []byte {
-	return nil
+	c.merge()
+	return c.mergedResult.Bytes()
 }
 
 func (c *safeChunk) NumSamples() int {
-	return 0
+	c.merge()
+	return c.mergedResult.NumSamples()
 }
 
 type headIndexReader struct {
