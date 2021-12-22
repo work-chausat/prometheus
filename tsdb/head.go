@@ -1392,7 +1392,9 @@ func (c *safeChunk) merge() {
 	}
 	c.s.Lock()
 	defer c.s.Unlock()
-
+	if c.mergedResult != nil {
+		return
+	}
 	if c.chunk == nil && c.stale == nil {
 		c.mergedResult = chunkenc.NewXORChunk()
 		return
