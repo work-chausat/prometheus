@@ -793,12 +793,17 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 				delIter.intervals = dranges
 
 				var (
-					t int64
-					v float64
+					headSample = true
+					t          int64
+					v          float64
 				)
 				for delIter.Next() {
 					t, v = delIter.At()
 					app.Append(t, v)
+					if headSample {
+						chks[i].MinTime = t
+						headSample = false
+					}
 				}
 				if err := delIter.Err(); err != nil {
 					return errors.Wrap(err, "iterate chunk while re-encoding")
