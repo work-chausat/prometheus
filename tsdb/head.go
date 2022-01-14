@@ -15,6 +15,7 @@ package tsdb
 
 import (
 	"fmt"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"math"
 	"runtime"
 	"sort"
@@ -79,8 +80,7 @@ type Head struct {
 	series *stripeSeries
 
 	symMtx  sync.RWMutex
-	symbols map[string]struct{}
-	values  map[string]stringset // label names to possible values
+	symbols *tsdbutil.StringBank
 
 	deletedMtx sync.Mutex
 	deleted    map[uint64]int // Deleted series, and what WAL segment they must be kept until.
@@ -274,8 +274,9 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int
 		minTime:    math.MaxInt64,
 		maxTime:    math.MinInt64,
 		series:     newStripeSeries(stripeSize),
-		values:     map[string]stringset{},
-		symbols:    map[string]struct{}{},
+		symbols:    tsdbutil.NewStringBank(1024),
+		//values:     map[string]stringset{},
+		//symbols:    map[string]struct{}{},
 		postings:   index.NewUnorderedMemPostings(),
 		tombstones: tombstones.NewMemTombstones(),
 		deleted:    map[uint64]int{},
@@ -923,7 +924,7 @@ func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 	if created {
 		a.series = append(a.series, record.RefSeries{
 			Ref:    s.ref,
-			Labels: lset,
+			Labels: s.lset,
 		})
 	}
 	return s.ref, a.AddFast(s.ref, t, v)
@@ -1117,34 +1118,6 @@ func (h *Head) gc() {
 		}
 		h.deletedMtx.Unlock()
 	}
-
-	// Rebuild symbols and label value indices from what is left in the postings terms.
-	// symMtx ensures that append of symbols and postings is disabled for rebuild time.
-	h.symMtx.Lock()
-	defer h.symMtx.Unlock()
-
-	// Rebuild symbols and label value indices from what is left in the postings terms.
-	symbols := make(map[string]struct{}, len(h.symbols))
-	values := make(map[string]stringset, len(h.values))
-
-	if err := h.postings.Iter(func(t labels.Label, _ index.Postings) error {
-		symbols[t.Name] = struct{}{}
-		symbols[t.Value] = struct{}{}
-
-		ss, ok := values[t.Name]
-		if !ok {
-			ss = stringset{}
-			values[t.Name] = ss
-		}
-		ss.set(t.Value)
-		return nil
-	}); err != nil {
-		// This should never happen, as the iteration function only returns nil.
-		panic(err)
-	}
-
-	h.symbols = symbols
-	h.values = values
 }
 
 // Tombstones returns a new reader over the head's tombstones
@@ -1297,41 +1270,34 @@ func (h *headIndexReader) Close() error {
 }
 
 func (h *headIndexReader) Symbols() index.StringIter {
-	h.head.symMtx.RLock()
-	res := make([]string, 0, len(h.head.symbols))
-
-	for s := range h.head.symbols {
-		res = append(res, s)
-	}
-	h.head.symMtx.RUnlock()
-
-	sort.Strings(res)
-	return index.NewStringListIter(res)
+	return h.head.postings.Symbols()
 }
 
-// LabelValues returns the possible label values
+// LabelValues returns label values present in the head for the
+// specific label name that are within the time range mint to maxt.
 func (h *headIndexReader) LabelValues(name string) ([]string, error) {
 	h.head.symMtx.RLock()
-	sl := make([]string, 0, len(h.head.values[name]))
-	for s := range h.head.values[name] {
-		sl = append(sl, s)
+	defer h.head.symMtx.RUnlock()
+	if h.maxt < h.head.MinTime() || h.mint > h.head.MaxTime() {
+		return []string{}, nil
 	}
-	h.head.symMtx.RUnlock()
-	sort.Strings(sl)
-	return sl, nil
+
+	values := h.head.postings.LabelValues(name)
+	return values, nil
 }
 
-// LabelNames returns all the unique label names present in the head.
+// LabelNames returns all the unique label names present in the head
+// that are within the time range mint to maxt.
 func (h *headIndexReader) LabelNames() ([]string, error) {
 	h.head.symMtx.RLock()
-	defer h.head.symMtx.RUnlock()
-	labelNames := make([]string, 0, len(h.head.values))
-	for name := range h.head.values {
-		if name == "" {
-			continue
-		}
-		labelNames = append(labelNames, name)
+	if h.maxt < h.head.MinTime() || h.mint > h.head.MaxTime() {
+		h.head.symMtx.RUnlock()
+		return []string{}, nil
 	}
+
+	labelNames := h.head.postings.LabelNames()
+	h.head.symMtx.RUnlock()
+
 	sort.Strings(labelNames)
 	return labelNames, nil
 }
@@ -1409,17 +1375,33 @@ func (h *headIndexReader) Series(ref uint64, lbls *labels.Labels, chks *[]chunks
 	return nil
 }
 
-func (h *Head) getOrCreate(hash uint64, lset labels.Labels) (*memSeries, bool) {
+func (h *Head) getOrCreate(hash uint64, l labels.Labels) (*memSeries, bool) {
 	// Just using `getOrSet` below would be semantically sufficient, but we'd create
 	// a new series on every sample inserted via Add(), which causes allocations
 	// and makes our series IDs rather random and harder to compress in postings.
-	s := h.series.getByHash(hash, lset)
+	s := h.series.getByHash(hash, l)
 	if s != nil {
 		return s, false
 	}
 
 	// Optimistically assume that we are the first one to create the series.
 	id := atomic.AddUint64(&h.lastSeriesID, 1)
+
+	lset := make([]labels.Label, len(l))
+	for i, lb := range l {
+		if name, ok := h.symbols.Get(lb.Name); ok {
+			lset[i].Name = name
+		} else {
+			lset[i].Name = lb.Name
+			h.symbols.Add(lset[i].Name)
+		}
+		if value, ok := h.symbols.Get(lb.Value); ok {
+			lset[i].Value = value
+		} else {
+			lset[i].Value = lb.Value
+			h.symbols.Add(lset[i].Value)
+		}
+	}
 
 	return h.getOrCreateWithID(id, hash, lset)
 }
@@ -1440,18 +1422,6 @@ func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSerie
 
 	h.postings.Add(id, lset)
 
-	for _, l := range lset {
-		valset, ok := h.values[l.Name]
-		if !ok {
-			valset = stringset{}
-			h.values[l.Name] = valset
-		}
-		valset.set(l.Value)
-
-		h.symbols[l.Name] = struct{}{}
-		h.symbols[l.Value] = struct{}{}
-	}
-
 	return s, true
 }
 
@@ -1462,23 +1432,33 @@ func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSerie
 type seriesHashmap map[uint64][]*memSeries
 
 func (m seriesHashmap) get(hash uint64, lset labels.Labels) *memSeries {
-	for _, s := range m[hash] {
-		if labels.Equal(s.lset, lset) {
-			return s
-		}
+	l := m[hash]
+
+	idx := tsdbutil.Search(len(l), func(i int) int {
+		return labels.Compare(l[i].lset, lset)
+	})
+
+	if idx == -1 {
+		return nil
 	}
-	return nil
+	return l[idx]
 }
 
 func (m seriesHashmap) set(hash uint64, s *memSeries) {
 	l := m[hash]
-	for i, prev := range l {
-		if labels.Equal(prev.lset, s.lset) {
-			l[i] = s
-			return
-		}
+
+	idx, ok := tsdbutil.SearchSeat(len(l), func(i int) int {
+		return labels.Compare(l[i].lset, s.lset)
+	})
+
+	if ok { // replace when exits
+		m[hash][idx] = s
+	} else if idx == len(l) {
+		m[hash] = append(l, s)
+	} else {
+		m[hash] = append(l[:idx+1], l[idx:]...)
+		m[hash][idx] = s
 	}
-	m[hash] = append(l, s)
 }
 
 func (m seriesHashmap) del(hash uint64, lset labels.Labels) {

@@ -766,7 +766,10 @@ func (w *Writer) writePostingsToTmpFiles() error {
 		// Try to bunch up label names into one loop, but avoid
 		// using more memory than a single label name can.
 		for len(names) > 0 {
-			if w.labelNames[names[0]]+c > maxPostings {
+			postings := w.labelNames[names[0]]
+			if w.labelNames[names[0]] > maxPostings {
+				return errors.Errorf("%v posting:%d should not bigger than all:%d", names[0], postings, maxPostings)
+			} else if w.labelNames[names[0]]+c > maxPostings {
 				break
 			}
 			batchNames = append(batchNames, names[0])

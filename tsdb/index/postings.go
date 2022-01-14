@@ -58,6 +58,28 @@ func NewUnorderedMemPostings() *MemPostings {
 	}
 }
 
+func (p *MemPostings) Symbols() StringIter {
+	p.mtx.RLock()
+
+	// Add all the strings to a map to de-duplicate.
+	symbols := make(map[string]struct{}, 512)
+	for n, e := range p.m {
+		symbols[n] = struct{}{}
+		for v := range e {
+			symbols[v] = struct{}{}
+		}
+	}
+	p.mtx.RUnlock()
+
+	res := make([]string, 0, len(symbols))
+	for k := range symbols {
+		res = append(res, k)
+	}
+
+	sort.Strings(res)
+	return NewStringListIter(res)
+}
+
 // SortedKeys returns a list of sorted label keys of the postings.
 func (p *MemPostings) SortedKeys() []labels.Label {
 	p.mtx.RLock()
@@ -77,6 +99,36 @@ func (p *MemPostings) SortedKeys() []labels.Label {
 		return keys[i].Value < keys[j].Value
 	})
 	return keys
+}
+
+// LabelNames returns all the unique label names.
+func (p *MemPostings) LabelNames() []string {
+	p.mtx.RLock()
+	defer p.mtx.RUnlock()
+	n := len(p.m)
+	if n == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, n-1)
+	for name := range p.m {
+		if name != allPostingsKey.Name {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// LabelValues returns label values for the given name.
+func (p *MemPostings) LabelValues(name string) []string {
+	p.mtx.RLock()
+	defer p.mtx.RUnlock()
+
+	values := make([]string, 0, len(p.m[name]))
+	for v := range p.m[name] {
+		values = append(values, v)
+	}
+	return values
 }
 
 // PostingsStats contains cardinality based statistics for postings.
