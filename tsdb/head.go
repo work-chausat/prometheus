@@ -19,6 +19,7 @@ import (
 	"math"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -920,7 +921,10 @@ func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 		return 0, errors.Wrap(ErrInvalidSample, fmt.Sprintf(`label name "%s" is not unique`, l))
 	}
 
-	s, created := a.head.getOrCreate(lset.Hash(), lset)
+	s, created, err := a.head.getOrCreate(lset.Hash(), lset)
+	if err != nil {
+		return 0, err
+	}
 	if created {
 		a.series = append(a.series, record.RefSeries{
 			Ref:    s.ref,
@@ -1375,15 +1379,17 @@ func (h *headIndexReader) Series(ref uint64, lbls *labels.Labels, chks *[]chunks
 	return nil
 }
 
-func (h *Head) getOrCreate(hash uint64, l labels.Labels) (*memSeries, bool) {
+func (h *Head) getOrCreate(hash uint64, l labels.Labels) (*memSeries, bool, error) {
 	// Just using `getOrSet` below would be semantically sufficient, but we'd create
 	// a new series on every sample inserted via Add(), which causes allocations
 	// and makes our series IDs rather random and harder to compress in postings.
 	s := h.series.getByHash(hash, l)
 	if s != nil {
-		return s, false
+		return s, false, nil
 	}
-
+	if h.NumSeries() > uint64(HeadMaxNumSeries) {
+		return nil, false, errors.Errorf("label:%v more than limit:%d", l.String(), strconv.Itoa(HeadMaxNumSeries))
+	}
 	// Optimistically assume that we are the first one to create the series.
 	id := atomic.AddUint64(&h.lastSeriesID, 1)
 
@@ -1403,7 +1409,8 @@ func (h *Head) getOrCreate(hash uint64, l labels.Labels) (*memSeries, bool) {
 		}
 	}
 
-	return h.getOrCreateWithID(id, hash, lset)
+	s, ok := h.getOrCreateWithID(id, hash, lset)
+	return s, ok, nil
 }
 
 func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSeries, bool) {

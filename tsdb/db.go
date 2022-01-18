@@ -48,6 +48,10 @@ const (
 	DefaultBlockDuration = int64(2 * 60 * 60 * 1000)
 )
 
+var (
+	HeadMaxNumSeries = math.MaxInt64
+)
+
 // DefaultOptions used for the DB. They are sane for setups using
 // millisecond precision timestamps.
 var DefaultOptions = &Options{
