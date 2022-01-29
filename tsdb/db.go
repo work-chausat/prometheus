@@ -32,7 +32,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/ulid"
-	"github.com/pkg/errors"
+	errors "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -71,6 +71,7 @@ type Options struct {
 	// Duration of persisted data to keep.
 	RetentionDuration uint64
 
+	MigrateDuration uint64
 	// Maximum number of bytes in blocks to be retained.
 	// 0 or less means disabled.
 	// NOTE: For proper storage calculations need to consider
@@ -152,6 +153,7 @@ type DB struct {
 
 	// Cancel a running compaction when a shutdown is initiated.
 	compactCancel context.CancelFunc
+	migrate       func(uid ulid.ULID)
 }
 
 type dbMetrics struct {
@@ -481,6 +483,154 @@ func (db *DBReadOnly) Close() error {
 	return merr.Err()
 }
 
+type MigratedDB struct {
+	*DB
+	cold *DB
+
+	autoMigrate sync.Mutex
+	waiting     sync.Map
+}
+
+func OpenMigratedDB(rwDir string, rwOpts *Options, rDir string, rOpts *Options, l log.Logger, r prometheus.Registerer) (mixedDB *MigratedDB, err error) {
+	mixedDB = &MigratedDB{}
+	hot, err := Open(rwDir, l, r, rwOpts)
+	if err != nil {
+		return nil, err
+	}
+	mixedDB.DB = hot
+
+	if rDir != "" {
+		cold, err := Open(rDir, l, nil, rOpts)
+		if err != nil {
+			return nil, err
+		}
+		cold.autoCompact = true
+		mixedDB.cold = cold
+		hot.migrate = mixedDB.onMigrate
+	}
+
+	return mixedDB, nil
+}
+
+func (db *MigratedDB) Close() error {
+	if db.cold == nil {
+		return db.DB.Close()
+	} else {
+		var merr tsdb_errors.MultiError
+		merr.Add(db.DB.Close())
+		merr.Add(db.cold.Close())
+		return merr.Err()
+	}
+}
+
+func (db *MigratedDB) Querier(mint, maxt int64) (Querier, error) {
+	maxBlockTime := int64(math.MinInt64)
+	if db.cold != nil && len(db.cold.blocks) > 0 {
+		maxBlockTime = db.cold.blocks[len(db.cold.blocks)-1].Meta().MaxTime
+	}
+	if db.cold == nil || mint > maxBlockTime {
+		return db.DB.Querier(mint, maxt)
+	}
+
+	var blocks []BlockReader
+	var blockMetas []BlockMeta
+	var combines []*Block
+	db.mtx.RLock()
+	db.cold.mtx.RLock()
+	defer db.mtx.RUnlock()
+	defer db.cold.mtx.RUnlock()
+
+	combines = append(combines, db.cold.blocks...)
+	combines = append(combines, db.DB.blocks...)
+	sort.Slice(combines, func(i, j int) bool {
+		return combines[i].Meta().MinTime < combines[j].Meta().MinTime
+	})
+
+	for _, b := range combines {
+		if b.OverlapsClosedInterval(mint, maxt) {
+			blocks = append(blocks, b)
+			blockMetas = append(blockMetas, b.Meta())
+		}
+	}
+	if maxt >= db.head.MinTime() {
+		blocks = append(blocks, &rangeHead{
+			head: db.head,
+			mint: mint,
+			maxt: maxt,
+		})
+	}
+
+	blockQueriers := make([]Querier, 0, len(blocks))
+	for _, b := range blocks {
+		q, err := NewBlockQuerier(b, mint, maxt)
+		if err == nil {
+			blockQueriers = append(blockQueriers, q)
+			continue
+		}
+		for _, q := range blockQueriers {
+			q.Close()
+		}
+		return nil, errors.Wrapf(err, "open querier for block %s", b)
+	}
+
+	if len(OverlappingBlocks(blockMetas)) > 0 {
+		return &verticalQuerier{
+			querier: querier{
+				blocks: blockQueriers,
+			},
+		}, nil
+	}
+
+	return &querier{
+		blocks: blockQueriers,
+	}, nil
+}
+
+func (db *MigratedDB) Snapshot(dir string, withHead bool) error {
+	if db.cold == nil {
+		return db.DB.Snapshot(dir, withHead)
+	} else {
+		var merr tsdb_errors.MultiError
+		merr.Add(db.cold.Snapshot(dir, false))
+		merr.Add(db.DB.Snapshot(dir, withHead))
+		return merr.Err()
+	}
+}
+
+func (db *MigratedDB) onMigrate(uid ulid.ULID) {
+	go func(uid ulid.ULID) {
+		var err error
+		db.cmtx.Lock()
+		defer db.cmtx.Unlock()
+		if _, loaded := db.waiting.LoadOrStore(uid, struct{}{}); loaded {
+			return
+		}
+		defer db.waiting.Delete(uid)
+
+		if !db.exists(uid) || db.head.compactable() {
+			return
+		}
+
+		level.Info(db.logger).Log("msg", "migrate starting", "uid", uid)
+		defer func(t time.Time) {
+			if db.cold.exists(uid) {
+				db.DB.deleteBlock(uid)
+			}
+			if err != nil {
+				level.Error(db.logger).Log("msg", "migrate failed", "uid", uid, "costTime", time.Since(t).String(), "err", err)
+			} else {
+				level.Info(db.logger).Log("msg", "migrate finish", "uid", uid, "costTime", time.Since(t).String())
+			}
+		}(time.Now())
+
+		if err = fileutil.CopyDirsSafely(filepath.Join(db.dir, uid.String()), filepath.Join(db.cold.dir, uid.String())); err != nil {
+			err = errors.Wrapf(err, "copy dir failed")
+			return
+		}
+		err = db.cold.reload()
+	}(uid)
+}
+
 // Open returns a new DB in the given directory.
 func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db *DB, err error) {
 	if err := os.MkdirAll(dir, 0777); err != nil {
@@ -632,6 +782,30 @@ func (db *DB) run() {
 // Appender opens a new appender against the database.
 func (db *DB) Appender() Appender {
 	return dbAppender{db: db, Appender: db.head.Appender()}
+}
+
+func (db *DB) exists(uid ulid.ULID) bool {
+	for _, block := range db.blocks {
+		if block.meta.ULID.Compare(uid) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (db *DB) deleteBlock(uid ulid.ULID) error {
+	blocks := make(map[ulid.ULID]*Block, 0)
+	db.mtx.Lock()
+	for i, block := range db.blocks {
+		if block.meta.ULID.Compare(uid) == 0 {
+			blocks[uid] = block
+			db.blocks = append(db.blocks[:i], db.blocks[i+1:]...)
+			break
+		}
+	}
+	db.mtx.Unlock()
+
+	return db.deleteBlocks(blocks)
 }
 
 // dbAppender wraps the DB's head appender and triggers compactions on commit
@@ -931,6 +1105,8 @@ func (db *DB) deletableBlocks(blocks []*Block) map[ulid.ULID]*Block {
 		deletable[ulid] = block
 	}
 
+	db.beyondTimeMigrate(blocks)
+
 	return deletable
 }
 
@@ -979,6 +1155,21 @@ func (db *DB) beyondSizeRetention(blocks []*Block) (deletable map[ulid.ULID]*Blo
 		}
 	}
 	return deletable
+}
+
+func (db *DB) beyondTimeMigrate(blocks []*Block) {
+	if len(db.blocks) == 0 || db.opts.MigrateDuration <= 0 {
+		return
+	}
+	for i, block := range blocks {
+		if i > 0 && blocks[0].Meta().MaxTime-block.Meta().MaxTime > int64(db.opts.MigrateDuration) {
+			for _, b := range blocks[i:] {
+				if db.migrate != nil {
+					db.migrate(b.meta.ULID)
+				}
+			}
+		}
+	}
 }
 
 // deleteBlocks closes and deletes blocks from the disk.

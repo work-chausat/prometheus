@@ -16,10 +16,9 @@ package labels
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/cespare/xxhash"
 	"sort"
 	"strconv"
-
-	"github.com/cespare/xxhash"
 )
 
 // Well-known label names used by Prometheus components.
@@ -266,6 +265,18 @@ func (ls Labels) HasDuplicateLabelNames() (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (ls Labels) IsSorted() bool {
+	for i, l := range ls {
+		if i == 0 {
+			continue
+		}
+		if ls[i-1].Name > l.Name {
+			return false
+		}
+	}
+	return true
 }
 
 // WithoutEmpty returns the labelset without empty labels.

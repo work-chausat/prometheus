@@ -18,7 +18,9 @@
 package fileutil
 
 import (
-	"io/ioutil"
+	"fmt"
+	"github.com/pkg/errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,7 +37,7 @@ func CopyDirs(src, dest string) error {
 	if err != nil {
 		return err
 	}
-
+	buf := make([]byte, 1024*1204)
 	for _, f := range files {
 		dp := filepath.Join(dest, f)
 		sp := filepath.Join(src, f)
@@ -53,22 +55,75 @@ func CopyDirs(src, dest string) error {
 			continue
 		}
 
-		if err := copyFile(sp, dp); err != nil {
+		if err := copyFile(sp, dp, buf); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func copyFile(src, dest string) error {
-	data, err := ioutil.ReadFile(src)
-	if err != nil {
+func CopyDirsSafely(src, dest string) (err error) {
+	tmp := dest + ".tmp"
+	defer func(dir string) {
+		os.RemoveAll(dir)
+	}(tmp)
+
+	if err = os.RemoveAll(tmp); err != nil {
+		return err
+	}
+	if err = CopyDirs(src, tmp); err != nil {
 		return err
 	}
 
-	err = ioutil.WriteFile(dest, data, 0644)
+	return Rename(tmp, dest)
+}
+
+//func copyFile(src, dest string) error {
+//	data, err := ioutil.ReadFile(src)
+//	if err != nil {
+//		return err
+//	}
+//
+//	err = ioutil.WriteFile(dest, data, 0644)
+//	if err != nil {
+//		return err
+//	}
+//	return nil
+//}
+
+func copyFile(src, dest string, buf []byte) error {
+	srcStat, err := os.Stat(src)
 	if err != nil {
 		return err
+	}
+	if !srcStat.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	destFile, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	for {
+		n, err := srcFile.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return errors.Wrapf(err, "file Read err %v", src)
+			}
+		}
+		if _, err := destFile.Write(buf[:n]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
