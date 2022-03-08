@@ -137,8 +137,9 @@ type BlockMeta struct {
 
 	// MinTime and MaxTime specify the time range all samples
 	// in the block are in.
-	MinTime int64 `json:"minTime"`
-	MaxTime int64 `json:"maxTime"`
+	MinTime     int64 `json:"minTime"`
+	MaxTime     int64 `json:"maxTime"`
+	CompactTime int64 `json:"compactTime"`
 
 	// Stats about the contents of the block.
 	Stats BlockStats `json:"stats,omitempty"`
@@ -445,6 +446,9 @@ func (r blockIndexReader) SortedPostings(p index.Postings) index.Postings {
 func (r blockIndexReader) Series(ref uint64, lset *labels.Labels, chks *[]chunks.Meta) error {
 	if err := r.ir.Series(ref, lset, chks); err != nil {
 		return errors.Wrapf(err, "block: %s", r.b.Meta().ULID)
+	}
+	for _, meta := range *chks {
+		meta.Term = r.b.meta.CompactTime
 	}
 	return nil
 }

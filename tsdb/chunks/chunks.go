@@ -65,6 +65,9 @@ type Meta struct {
 	// Time range the data covers.
 	// When MaxTime == math.MaxInt64 the chunk is still open and being appended to.
 	MinTime, MaxTime int64
+
+	//When samples have the same time, we use chunk has bigger term
+	Term int64
 }
 
 // writeHash writes the chunk encoding and raw data into the provided hash.
@@ -256,7 +259,15 @@ func MergeOverlappingChunks(chks []Meta) ([]Meta, error) {
 		if c.MaxTime > nc.MaxTime {
 			nc.MaxTime = c.MaxTime
 		}
-		chk, err := MergeChunks(nc.Chunk, c.Chunk)
+		var (
+			chk chunkenc.Chunk
+			err error
+		)
+		if nc.Term > c.Term {
+			chk, err = MergeChunks(c.Chunk, nc.Chunk)
+		} else {
+			chk, err = MergeChunks(nc.Chunk, c.Chunk)
+		}
 		if err != nil {
 			return nil, err
 		}

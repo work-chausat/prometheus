@@ -331,8 +331,9 @@ func splitByRange(ds []dirMeta, tr int64) [][]dirMeta {
 
 func compactBlockMetas(uid ulid.ULID, blocks ...*BlockMeta) *BlockMeta {
 	res := &BlockMeta{
-		ULID:    uid,
-		MinTime: blocks[0].MinTime,
+		ULID:        uid,
+		MinTime:     blocks[0].MinTime,
+		CompactTime: blocks[0].CompactTime,
 	}
 
 	sources := map[ulid.ULID]struct{}{}
@@ -346,6 +347,9 @@ func compactBlockMetas(uid ulid.ULID, blocks ...*BlockMeta) *BlockMeta {
 		}
 		if b.Compaction.Level > res.Compaction.Level {
 			res.Compaction.Level = b.Compaction.Level
+		}
+		if b.CompactTime > res.CompactTime {
+			res.CompactTime = b.CompactTime
 		}
 		for _, s := range b.Compaction.Sources {
 			sources[s] = struct{}{}
@@ -416,6 +420,15 @@ func (c *LeveledCompactor) Compact(dest string, dirs []string, open []*Block) (u
 	uid = ulid.MustNew(ulid.Now(), entropy)
 
 	meta := compactBlockMetas(uid, metas...)
+	level.Info(c.logger).Log(
+		"msg", "start compact blocks",
+		"count", len(blocks),
+		"mint", meta.MinTime,
+		"maxt", meta.MaxTime,
+		"ulid", meta.ULID,
+		"sources", fmt.Sprintf("%v", uids),
+	)
+
 	err = c.write(dest, meta, blocks...)
 	if err == nil {
 		if meta.Stats.NumSamples == 0 {
@@ -438,15 +451,7 @@ func (c *LeveledCompactor) Compact(dest string, dirs []string, open []*Block) (u
 				"duration", time.Since(start),
 			)
 		} else {
-			level.Info(c.logger).Log(
-				"msg", "compact blocks",
-				"count", len(blocks),
-				"mint", meta.MinTime,
-				"maxt", meta.MaxTime,
-				"ulid", meta.ULID,
-				"sources", fmt.Sprintf("%v", uids),
-				"duration", time.Since(start),
-			)
+			level.Info(c.logger).Log("msg", "compact success", "duration", time.Since(start))
 		}
 		return uid, nil
 	}
@@ -471,9 +476,10 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 	uid := ulid.MustNew(ulid.Now(), entropy)
 
 	meta := &BlockMeta{
-		ULID:    uid,
-		MinTime: mint,
-		MaxTime: maxt,
+		ULID:        uid,
+		MinTime:     mint,
+		MaxTime:     maxt,
+		CompactTime: time.Now().Unix(),
 	}
 	meta.Compaction.Level = 1
 	meta.Compaction.Sources = []ulid.ULID{uid}
@@ -490,6 +496,12 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 	}
 
 	if meta.Stats.NumSamples == 0 {
+		level.Info(c.logger).Log(
+			"msg", "write block resulted in empty block",
+			"mint", meta.MinTime,
+			"maxt", meta.MaxTime,
+			"duration", time.Since(start),
+		)
 		return ulid.ULID{}, nil
 	}
 
@@ -763,7 +775,8 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			// chunks are closed hence the chk.MaxTime >= meta.MaxTime check.
 			//
 			// TODO think how to avoid the typecasting to verify when it is head block.
-			if _, isHeadChunk := chk.Chunk.(*safeChunk); isHeadChunk {
+			//_, safeChunk := chk.Chunk.(*safeChunk)
+			if _, mutable := chk.Chunk.(*mutableChunk); mutable {
 				if chk.MaxTime >= meta.MaxTime {
 					dranges = append(dranges, tombstones.Interval{Mint: meta.MaxTime, Maxt: math.MaxInt64})
 				}
@@ -793,16 +806,17 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 				delIter.intervals = dranges
 
 				var (
-					headSample = true
-					t          int64
-					v          float64
+					firstIter = true
+					t         int64
+					v         float64
 				)
 				for delIter.Next() {
 					t, v = delIter.At()
 					app.Append(t, v)
-					if headSample {
+
+					if firstIter {
 						chks[i].MinTime = t
-						headSample = false
+						firstIter = false
 					}
 				}
 				if err := delIter.Err(); err != nil {
