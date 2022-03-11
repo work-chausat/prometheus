@@ -160,8 +160,9 @@ type DB struct {
 	autoCompact    bool
 
 	// Cancel a running compaction when a shutdown is initiated.
-	compactCancel context.CancelFunc
-	migrate       func(uid ulid.ULID)
+	compactCancel     context.CancelFunc
+	migrate           func(uid ulid.ULID)
+	latestCompactTime time.Time
 }
 
 type dbMetrics struct {
@@ -493,7 +494,7 @@ func (db *DBReadOnly) Close() error {
 
 type MigratedDB struct {
 	*DB
-	cold *DB
+	Cold *DB
 
 	autoMigrate sync.Mutex
 	waiting     sync.Map
@@ -513,7 +514,7 @@ func OpenMigratedDB(rwDir string, rwOpts *Options, rDir string, rOpts *Options, 
 			return nil, err
 		}
 		cold.autoCompact = true
-		mixedDB.cold = cold
+		mixedDB.Cold = cold
 		hot.migrate = mixedDB.onMigrate
 	}
 
@@ -521,22 +522,22 @@ func OpenMigratedDB(rwDir string, rwOpts *Options, rDir string, rOpts *Options, 
 }
 
 func (db *MigratedDB) Close() error {
-	if db.cold == nil {
+	if db.Cold == nil {
 		return db.DB.Close()
 	} else {
 		var merr tsdb_errors.MultiError
 		merr.Add(db.DB.Close())
-		merr.Add(db.cold.Close())
+		merr.Add(db.Cold.Close())
 		return merr.Err()
 	}
 }
 
 func (db *MigratedDB) Querier(mint, maxt int64) (Querier, error) {
 	maxBlockTime := int64(math.MinInt64)
-	if db.cold != nil && len(db.cold.blocks) > 0 {
-		maxBlockTime = db.cold.blocks[len(db.cold.blocks)-1].Meta().MaxTime
+	if db.Cold != nil && len(db.Cold.blocks) > 0 {
+		maxBlockTime = db.Cold.blocks[len(db.Cold.blocks)-1].Meta().MaxTime
 	}
-	if db.cold == nil || mint > maxBlockTime {
+	if db.Cold == nil || mint > maxBlockTime {
 		return db.DB.Querier(mint, maxt)
 	}
 
@@ -544,11 +545,11 @@ func (db *MigratedDB) Querier(mint, maxt int64) (Querier, error) {
 	var blockMetas []BlockMeta
 	var combines []*Block
 	db.mtx.RLock()
-	db.cold.mtx.RLock()
+	db.Cold.mtx.RLock()
 	defer db.mtx.RUnlock()
-	defer db.cold.mtx.RUnlock()
+	defer db.Cold.mtx.RUnlock()
 
-	combines = append(combines, db.cold.blocks...)
+	combines = append(combines, db.Cold.blocks...)
 	combines = append(combines, db.DB.blocks...)
 	sort.Slice(combines, func(i, j int) bool {
 		return combines[i].Meta().MinTime < combines[j].Meta().MinTime
@@ -594,17 +595,6 @@ func (db *MigratedDB) Querier(mint, maxt int64) (Querier, error) {
 	}, nil
 }
 
-func (db *MigratedDB) Snapshot(dir string, withHead bool) error {
-	if db.cold == nil {
-		return db.DB.Snapshot(dir, withHead)
-	} else {
-		var merr tsdb_errors.MultiError
-		merr.Add(db.cold.Snapshot(dir, false))
-		merr.Add(db.DB.Snapshot(dir, withHead))
-		return merr.Err()
-	}
-}
-
 func (db *MigratedDB) onMigrate(uid ulid.ULID) {
 	go func(uid ulid.ULID) {
 		var err error
@@ -621,7 +611,7 @@ func (db *MigratedDB) onMigrate(uid ulid.ULID) {
 
 		level.Info(db.logger).Log("msg", "migrate starting", "uid", uid)
 		defer func(t time.Time) {
-			if db.cold.exists(uid) {
+			if db.Cold.exists(uid) {
 				db.DB.deleteBlock(uid)
 			}
 			if err != nil {
@@ -631,11 +621,11 @@ func (db *MigratedDB) onMigrate(uid ulid.ULID) {
 			}
 		}(time.Now())
 
-		if err = fileutil.CopyDirsSafely(filepath.Join(db.dir, uid.String()), filepath.Join(db.cold.dir, uid.String())); err != nil {
+		if err = fileutil.CopyDirsSafely(filepath.Join(db.dir, uid.String()), filepath.Join(db.Cold.dir, uid.String())); err != nil {
 			err = errors.Wrapf(err, "copy dir failed")
 			return
 		}
-		err = db.cold.reload()
+		err = db.Cold.reload()
 	}(uid)
 }
 
@@ -780,7 +770,9 @@ func (db *DB) run() {
 
 			db.autoCompactMtx.Lock()
 			if db.autoCompact {
-				if err := db.Compact(); err != nil {
+				maxInterval := time.Duration(db.head.chunkRange*4) * time.Millisecond
+				forceCompact := time.Now().After(db.latestCompactTime.Add(maxInterval))
+				if err := db.Compact(forceCompact); err != nil {
 					level.Error(db.logger).Log("msg", "compaction failed", "err", err)
 					backoff = exponential(backoff, 1*time.Second, 1*time.Minute)
 				} else {
@@ -853,7 +845,7 @@ func (a dbAppender) Commit() error {
 // this is sufficient to reliably delete old data.
 // Old blocks are only deleted on reload based on the new block's parent information.
 // See DB.reload documentation for further information.
-func (db *DB) Compact() (err error) {
+func (db *DB) Compact(forceCompact bool) (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 	defer func() {
@@ -868,12 +860,19 @@ func (db *DB) Compact() (err error) {
 	// Check whether we have pending head blocks that are ready to be persisted.
 	// They have the highest priority.
 
-	for i := 0; db.head.compactable(); i++ {
+	for i := 0; db.head.compactable() || forceCompact; i++ {
+		db.latestCompactTime = time.Now()
 		select {
 		case <-db.stopc:
 			return nil
 		default:
 		}
+
+		if db.head.minTime > db.head.maxTime {
+			level.Info(db.logger).Log("msg", "no data exist in memory")
+			break
+		}
+
 		if i == 0 {
 			mint = db.head.splitMinTime()
 		} else {
@@ -883,7 +882,7 @@ func (db *DB) Compact() (err error) {
 		//maybe middle chunks is all empty
 		//maybe tail chunks can compact
 		//flush five blocks at the most
-		if maxt < db.head.MinTime() || mint > db.head.MaxTime() || i > int(chunkenc.MaxOffsetWindow/db.head.chunkRange) {
+		if maxt < db.head.MinTime() || mint > db.head.MaxTime() || (i != 0 && i >= int(chunkenc.MaxOffsetWindow/db.head.chunkRange)) {
 			level.Info(db.logger).Log("maxt", maxt, "mint", mint, "headMin", db.head.MinTime(), "headMax", db.head.MaxTime(), "i", i)
 			break
 		}
