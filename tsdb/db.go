@@ -881,7 +881,7 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 		maxt = rangeForTimestamp(mint, db.head.chunkRange)
 		//maybe middle chunks is all empty
 		//maybe tail chunks can compact
-		//flush five blocks at the most
+		//flush blocks at the most
 		if maxt < db.head.MinTime() || mint > db.head.MaxTime() || (i != 0 && i >= int(chunkenc.MaxOffsetWindow/db.head.chunkRange)) {
 			level.Info(db.logger).Log("maxt", maxt, "mint", mint, "headMin", db.head.MinTime(), "headMax", db.head.MaxTime(), "i", i)
 			break
