@@ -211,7 +211,7 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 	})
 	m.reloadsFailed = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_reloads_failures_total",
-		Help: "Number of times the database failed to reload block data from disk.",
+		Help: "Number of times the database failed to Reload block data from disk.",
 	})
 	m.compactionsTriggered = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_compactions_triggered_total",
@@ -625,7 +625,7 @@ func (db *MigratedDB) onMigrate(uid ulid.ULID) {
 			err = errors.Wrapf(err, "copy dir failed")
 			return
 		}
-		err = db.Cold.reload()
+		err = db.Cold.Reload()
 	}(uid)
 }
 
@@ -718,7 +718,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		return nil, err
 	}
 
-	if err := db.reload(); err != nil {
+	if err := db.Reload(); err != nil {
 		return nil, err
 	}
 	// Set the min valid time for the ingested samples
@@ -843,8 +843,8 @@ func (a dbAppender) Commit() error {
 // window.
 // If no blocks are compacted, the retention window state doesn't change. Thus,
 // this is sufficient to reliably delete old data.
-// Old blocks are only deleted on reload based on the new block's parent information.
-// See DB.reload documentation for further information.
+// Old blocks are only deleted on Reload based on the new block's parent information.
+// See DB.Reload documentation for further information.
 func (db *DB) Compact(forceCompact bool) (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
@@ -910,14 +910,14 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 
 		runtime.GC()
 
-		if err := db.reload(); err != nil {
+		if err := db.Reload(); err != nil {
 			if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
-				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid)
+				return errors.Wrapf(err, "delete persisted head block after failed db Reload:%s", uid)
 			}
-			return errors.Wrap(err, "reload blocks")
+			return errors.Wrap(err, "Reload blocks")
 		}
 		// Compaction resulted in an empty block.
-		// Head truncating during db.reload() depends on the persisted blocks and
+		// Head truncating during db.Reload() depends on the persisted blocks and
 		// in this case no new block will be persisted so manually truncate the head.
 		db.head.gc(maxt, false)
 		runtime.GC()
@@ -945,11 +945,11 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 		}
 		runtime.GC()
 
-		if err := db.reload(); err != nil {
+		if err := db.Reload(); err != nil {
 			if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
-				return errors.Wrapf(err, "delete compacted block after failed db reload:%s", uid)
+				return errors.Wrapf(err, "delete compacted block after failed db Reload:%s", uid)
 			}
-			return errors.Wrap(err, "reload blocks")
+			return errors.Wrap(err, "Reload blocks")
 		}
 		runtime.GC()
 
@@ -976,9 +976,9 @@ func getBlock(allBlocks []*Block, id ulid.ULID) (*Block, bool) {
 	return nil, false
 }
 
-// reload blocks and trigger head truncation if new blocks appeared.
+// Reload blocks and trigger head truncation if new blocks appeared.
 // Blocks that are obsolete due to replacement or retention will be deleted.
-func (db *DB) reload() (err error) {
+func (db *DB) Reload() (err error) {
 	defer func() {
 		if err != nil {
 			db.metrics.reloadsFailed.Inc()
@@ -1050,7 +1050,7 @@ func (db *DB) reload() (err error) {
 		blockMetas = append(blockMetas, b.Meta())
 	}
 	if overlaps := OverlappingBlocks(blockMetas); len(overlaps) > 0 {
-		level.Warn(db.logger).Log("msg", "overlapping blocks found during reload", "detail", overlaps.String())
+		level.Warn(db.logger).Log("msg", "overlapping blocks found during Reload", "detail", overlaps.String())
 	}
 
 	for _, b := range oldBlocks {
@@ -1567,7 +1567,7 @@ func (db *DB) CleanTombstones() (err error) {
 			newUIDs = append(newUIDs, *uid)
 		}
 	}
-	return errors.Wrap(db.reload(), "reload blocks")
+	return errors.Wrap(db.Reload(), "Reload blocks")
 }
 
 func isBlockDir(fi os.FileInfo) bool {

@@ -530,8 +530,8 @@ func TestHeadDeleteSimple(t *testing.T) {
 				}
 				testutil.Ok(t, app.Commit())
 
-				// Compare the samples for both heads - before and after the reload.
-				reloadedW, err := wal.New(nil, nil, w.Dir(), compress) // Use a new wal to ensure deleted samples are gone even after a reload.
+				// Compare the samples for both heads - before and after the Reload.
+				reloadedW, err := wal.New(nil, nil, w.Dir(), compress) // Use a new wal to ensure deleted samples are gone even after a Reload.
 				testutil.Ok(t, err)
 				defer reloadedW.Close()
 				reloadedHead, err := NewHead(nil, nil, reloadedW, 1000, DefaultStripeSize, DefaultWaterMark)
@@ -539,7 +539,7 @@ func TestHeadDeleteSimple(t *testing.T) {
 				defer reloadedHead.Close()
 				testutil.Ok(t, reloadedHead.Init(timestamp.FromTime(time.Now())))
 
-				// Compare the query results for both heads - before and after the reload.
+				// Compare the query results for both heads - before and after the Reload.
 				expSeriesSet := newMockSeriesSet([]Series{
 					newSeries(map[string]string{lblDefault.Name: lblDefault.Value}, func() []tsdbutil.Sample {
 						ss := make([]tsdbutil.Sample, 0, len(c.smplsExp))
