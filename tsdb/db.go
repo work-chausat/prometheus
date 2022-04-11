@@ -49,7 +49,7 @@ const (
 )
 
 var (
-	PointsOutOfOrderMode = false
+	PointsOutOfOrderMode = true
 	HeadMaxNumSeries     = math.MaxInt64
 )
 
@@ -133,6 +133,7 @@ type Appender interface {
 // a hashed partition of a seriedb.
 type DB struct {
 	dir   string
+	name  string
 	lockf fileutil.Releaser
 
 	logger    log.Logger
@@ -183,18 +184,23 @@ type dbMetrics struct {
 
 func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 	m := &dbMetrics{}
+	constLabels := prometheus.Labels{
+		"db": db.name,
+	}
 
 	m.loadedBlocks = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_blocks_loaded",
-		Help: "Number of currently loaded data blocks",
+		Name:        "prometheus_tsdb_blocks_loaded",
+		Help:        "Number of currently loaded data blocks",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		db.mtx.RLock()
 		defer db.mtx.RUnlock()
 		return float64(len(db.blocks))
 	})
 	m.symbolTableSize = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_symbol_table_size_bytes",
-		Help: "Size of symbol table on disk (in bytes)",
+		Name:        "prometheus_tsdb_symbol_table_size_bytes",
+		Help:        "Size of symbol table on disk (in bytes)",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		db.mtx.RLock()
 		blocks := db.blocks[:]
@@ -206,32 +212,39 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		return float64(symTblSize)
 	})
 	m.reloads = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_reloads_total",
-		Help: "Number of times the database reloaded block data from disk.",
+		Name:        "prometheus_tsdb_reloads_total",
+		Help:        "Number of times the database reloaded block data from disk.",
+		ConstLabels: constLabels,
 	})
 	m.reloadsFailed = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_reloads_failures_total",
-		Help: "Number of times the database failed to Reload block data from disk.",
+		Name:        "prometheus_tsdb_reloads_failures_total",
+		Help:        "Number of times the database failed to Reload block data from disk.",
+		ConstLabels: constLabels,
 	})
 	m.compactionsTriggered = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_compactions_triggered_total",
-		Help: "Total number of triggered compactions for the partition.",
+		Name:        "prometheus_tsdb_compactions_triggered_total",
+		Help:        "Total number of triggered compactions for the partition.",
+		ConstLabels: constLabels,
 	})
 	m.compactionsFailed = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_compactions_failed_total",
-		Help: "Total number of compactions that failed for the partition.",
+		Name:        "prometheus_tsdb_compactions_failed_total",
+		Help:        "Total number of compactions that failed for the partition.",
+		ConstLabels: constLabels,
 	})
 	m.timeRetentionCount = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_time_retentions_total",
-		Help: "The number of times that blocks were deleted because the maximum time limit was exceeded.",
+		Name:        "prometheus_tsdb_time_retentions_total",
+		Help:        "The number of times that blocks were deleted because the maximum time limit was exceeded.",
+		ConstLabels: constLabels,
 	})
 	m.compactionsSkipped = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_compactions_skipped_total",
-		Help: "Total number of skipped compactions due to disabled auto compaction.",
+		Name:        "prometheus_tsdb_compactions_skipped_total",
+		Help:        "Total number of skipped compactions due to disabled auto compaction.",
+		ConstLabels: constLabels,
 	})
 	m.startTime = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_lowest_timestamp",
-		Help: "Lowest timestamp value stored in the database. The unit is decided by the library consumer.",
+		Name:        "prometheus_tsdb_lowest_timestamp",
+		Help:        "Lowest timestamp value stored in the database. The unit is decided by the library consumer.",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		db.mtx.RLock()
 		defer db.mtx.RUnlock()
@@ -241,20 +254,24 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		return float64(db.blocks[0].meta.MinTime)
 	})
 	m.tombCleanTimer = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name: "prometheus_tsdb_tombstone_cleanup_seconds",
-		Help: "The time taken to recompact blocks to remove tombstones.",
+		Name:        "prometheus_tsdb_tombstone_cleanup_seconds",
+		Help:        "The time taken to recompact blocks to remove tombstones.",
+		ConstLabels: constLabels,
 	})
 	m.blocksBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_storage_blocks_bytes",
-		Help: "The number of bytes that are currently used for local storage by all blocks.",
+		Name:        "prometheus_tsdb_storage_blocks_bytes",
+		Help:        "The number of bytes that are currently used for local storage by all blocks.",
+		ConstLabels: constLabels,
 	})
 	m.maxBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_retention_limit_bytes",
-		Help: "Max number of bytes to be retained in the tsdb blocks, configured 0 means disabled",
+		Name:        "prometheus_tsdb_retention_limit_bytes",
+		Help:        "Max number of bytes to be retained in the tsdb blocks, configured 0 means disabled",
+		ConstLabels: constLabels,
 	})
 	m.sizeRetentionCount = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_size_retentions_total",
-		Help: "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
+		Name:        "prometheus_tsdb_size_retentions_total",
+		Help:        "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
+		ConstLabels: constLabels,
 	})
 
 	if r != nil {
@@ -324,7 +341,7 @@ func (db *DBReadOnly) FlushWAL(dir string) error {
 	if err != nil {
 		return err
 	}
-	head, err := NewHead(nil, db.logger, w, 1, DefaultStripeSize, DefaultWaterMark)
+	head, err := NewHead("default", nil, db.logger, w, 1, DefaultStripeSize, DefaultWaterMark)
 	if err != nil {
 		return err
 	}
@@ -371,7 +388,7 @@ func (db *DBReadOnly) Querier(mint, maxt int64) (Querier, error) {
 		blocks[i] = b
 	}
 
-	head, err := NewHead(nil, db.logger, nil, 1, DefaultStripeSize, DefaultWaterMark)
+	head, err := NewHead("default", nil, db.logger, nil, 1, DefaultStripeSize, DefaultWaterMark)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +403,7 @@ func (db *DBReadOnly) Querier(mint, maxt int64) (Querier, error) {
 		if err != nil {
 			return nil, err
 		}
-		head, err = NewHead(nil, db.logger, w, 1, DefaultStripeSize, DefaultWaterMark)
+		head, err = NewHead("default", nil, db.logger, w, 1, DefaultStripeSize, DefaultWaterMark)
 		if err != nil {
 			return nil, err
 		}
@@ -500,16 +517,16 @@ type MigratedDB struct {
 	waiting     sync.Map
 }
 
-func OpenMigratedDB(rwDir string, rwOpts *Options, rDir string, rOpts *Options, l log.Logger, r prometheus.Registerer) (mixedDB *MigratedDB, err error) {
+func OpenMigratedDB(rwDir string, rwOpts *Options, rDir string, rOpts *Options, l log.Logger, reg prometheus.Registerer) (mixedDB *MigratedDB, err error) {
 	mixedDB = &MigratedDB{}
-	hot, err := Open(rwDir, l, r, rwOpts)
+	hot, err := OpenDB("hot", rwDir, l, reg, rwOpts)
 	if err != nil {
 		return nil, err
 	}
 	mixedDB.DB = hot
 
 	if rDir != "" {
-		cold, err := Open(rDir, l, nil, rOpts)
+		cold, err := OpenDB("cold", rDir, l, reg, rOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -629,8 +646,37 @@ func (db *MigratedDB) onMigrate(uid ulid.ULID) {
 	}(uid)
 }
 
+func (db *MigratedDB) CombinesBlocks() []*Block {
+	if db.Cold == nil {
+		return db.DB.Blocks()
+	}
+	var combines []*Block
+	cBlock := db.Cold.Blocks()
+	hBlock := db.DB.Blocks()
+	if len(cBlock) != 0 {
+		combines = append(combines, cBlock...)
+	}
+	if len(hBlock) != 0 {
+		combines = append(combines, hBlock...)
+	}
+
+	sort.Slice(combines, func(i, j int) bool {
+		return combines[i].Meta().MinTime < combines[j].Meta().MinTime
+	})
+
+	return combines
+}
+
 // Open returns a new DB in the given directory.
-func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db *DB, err error) {
+func Open(dir string, l log.Logger, reg prometheus.Registerer, opts *Options) (db *DB, err error) {
+	return OpenDB("", dir, l, reg, opts)
+}
+func OpenDB(name, dir string, l log.Logger, reg prometheus.Registerer, opts *Options) (db *DB, err error) {
+	var dispensableReg prometheus.Registerer
+	if name == "default" || name == "hot" {
+		dispensableReg = reg
+	}
+
 	if err := os.MkdirAll(dir, 0777); err != nil {
 		return nil, err
 	}
@@ -653,16 +699,18 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 	}
 
 	db = &DB{
-		dir:         dir,
-		logger:      l,
-		opts:        opts,
-		compactc:    make(chan struct{}, 1),
-		donec:       make(chan struct{}),
-		stopc:       make(chan struct{}),
-		autoCompact: true,
-		chunkPool:   chunkenc.NewPool(),
+		name:              name,
+		dir:               dir,
+		logger:            l,
+		opts:              opts,
+		compactc:          make(chan struct{}, 1),
+		donec:             make(chan struct{}),
+		stopc:             make(chan struct{}),
+		autoCompact:       true,
+		chunkPool:         chunkenc.NewPool(),
+		latestCompactTime: time.Now(),
 	}
-	db.metrics = newDBMetrics(db, r)
+	db.metrics = newDBMetrics(db, reg)
 
 	maxBytes := opts.MaxBytes
 	if maxBytes < 0 {
@@ -687,7 +735,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	db.compactor, err = NewLeveledCompactor(ctx, r, l, opts.BlockRanges, db.chunkPool)
+	db.compactor, err = NewLeveledCompactor(ctx, dispensableReg, l, opts.BlockRanges, db.chunkPool)
 	if err != nil {
 		cancel()
 		return nil, errors.Wrap(err, "create leveled compactor")
@@ -702,7 +750,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		if opts.WALSegmentSize > 0 {
 			segmentSize = opts.WALSegmentSize
 		}
-		wlog, err = wal.NewSize(l, r, filepath.Join(dir, "wal"), segmentSize, opts.WALCompression)
+		wlog, err = wal.NewSize(l, dispensableReg, filepath.Join(dir, "wal"), segmentSize, opts.WALCompression)
 		if err != nil {
 			return nil, err
 		}
@@ -713,7 +761,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 			opts.WaterMarkCompact.Low, opts.WaterMarkCompact.High)
 	}
 
-	db.head, err = NewHead(r, l, wlog, opts.BlockRanges[0], opts.StripeSize, opts.WaterMarkCompact)
+	db.head, err = NewHead(name, reg, l, wlog, opts.BlockRanges[0], opts.StripeSize, opts.WaterMarkCompact)
 	if err != nil {
 		return nil, err
 	}

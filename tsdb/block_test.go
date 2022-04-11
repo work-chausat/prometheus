@@ -279,7 +279,7 @@ func TestReadIndexFormatV1(t *testing.T) {
 	     app.Add(labels.FromStrings("bar", strconv.FormatInt(int64(i), 10)), 0, 0)
 	   }
 	   app.Commit()
-	   db.compact()
+	   db.Compact(false)
 	   db.Close()
 	*/
 
@@ -320,7 +320,7 @@ func createBlockFromHead(tb testing.TB, dir string, head *Head) string {
 }
 
 func createHead(tb testing.TB, series []Series) *Head {
-	head, err := NewHead(nil, nil, nil, 2*60*60*1000, DefaultStripeSize, DefaultWaterMark)
+	head, err := NewHead("default", nil, nil, nil, 2*60*60*1000, DefaultStripeSize, DefaultWaterMark)
 	testutil.Ok(tb, err)
 	defer head.Close()
 

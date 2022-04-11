@@ -71,6 +71,7 @@ type WaterMark struct {
 type Head struct {
 	// Keep all 64bit atomically accessed variables at the top of this struct.
 	// See https://golang.org/pkg/sync/atomic/#pkg-note-BUG for more info.
+	name             string
 	chunkRange       int64
 	numSeries        uint64
 	minTime, maxTime int64 // Current min and max of the samples included in the head.
@@ -132,106 +133,130 @@ type headMetrics struct {
 
 func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 	m := &headMetrics{}
-
+	constLabels := prometheus.Labels{
+		"db": h.name,
+	}
 	m.activeAppenders = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_head_active_appenders",
-		Help: "Number of currently active appender transactions",
+		Name:        "prometheus_tsdb_head_active_appenders",
+		Help:        "Number of currently active appender transactions",
+		ConstLabels: constLabels,
 	})
 	m.series = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_head_series",
-		Help: "Total number of series in the head block.",
+		Name:        "prometheus_tsdb_head_series",
+		Help:        "Total number of series in the head block.",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		return float64(h.NumSeries())
 	})
 	m.seriesCreated = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_series_created_total",
-		Help: "Total number of series created in the head",
+		Name:        "prometheus_tsdb_head_series_created_total",
+		Help:        "Total number of series created in the head",
+		ConstLabels: constLabels,
 	})
 	m.seriesRemoved = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_series_removed_total",
-		Help: "Total number of series removed in the head",
+		Name:        "prometheus_tsdb_head_series_removed_total",
+		Help:        "Total number of series removed in the head",
+		ConstLabels: constLabels,
 	})
 	m.seriesNotFound = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_series_not_found_total",
-		Help: "Total number of requests for series that were not found.",
+		Name:        "prometheus_tsdb_head_series_not_found_total",
+		Help:        "Total number of requests for series that were not found.",
+		ConstLabels: constLabels,
 	})
 	m.chunks = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_head_chunks",
-		Help: "Total number of chunks in the head block.",
+		Name:        "prometheus_tsdb_head_chunks",
+		Help:        "Total number of chunks in the head block.",
+		ConstLabels: constLabels,
 	})
 	m.chunksCreated = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_chunks_created_total",
-		Help: "Total number of chunks created in the head",
+		Name:        "prometheus_tsdb_head_chunks_created_total",
+		Help:        "Total number of chunks created in the head",
+		ConstLabels: constLabels,
 	})
 	m.chunksRemoved = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_chunks_removed_total",
-		Help: "Total number of chunks removed in the head",
+		Name:        "prometheus_tsdb_head_chunks_removed_total",
+		Help:        "Total number of chunks removed in the head",
+		ConstLabels: constLabels,
 	})
 	m.unOrderedTotal = prometheus.NewCounterFunc(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_unordered_total",
-		Help: "Total samples unordered",
+		Name:        "prometheus_tsdb_head_unordered_total",
+		Help:        "Total samples unordered",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		return float64(chunkenc.UnOrderedTotal)
 	})
 	m.gcDuration = prometheus.NewSummary(prometheus.SummaryOpts{
-		Name:       "prometheus_tsdb_head_gc_duration_seconds",
-		Help:       "Runtime of garbage collection in the head block.",
-		Objectives: map[float64]float64{},
+		Name:        "prometheus_tsdb_head_gc_duration_seconds",
+		Help:        "Runtime of garbage collection in the head block.",
+		ConstLabels: constLabels,
+		Objectives:  map[float64]float64{},
 	})
 	m.maxTime = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_head_max_time",
-		Help: "Maximum timestamp of the head block. The unit is decided by the library consumer.",
+		Name:        "prometheus_tsdb_head_max_time",
+		Help:        "Maximum timestamp of the head block. The unit is decided by the library consumer.",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		return float64(h.MaxTime())
 	})
 	m.minTime = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_head_min_time",
-		Help: "Minimum time bound of the head block. The unit is decided by the library consumer.",
+		Name:        "prometheus_tsdb_head_min_time",
+		Help:        "Minimum time bound of the head block. The unit is decided by the library consumer.",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		return float64(h.MinTime())
 	})
 	m.walTruncateDuration = prometheus.NewSummary(prometheus.SummaryOpts{
-		Name:       "prometheus_tsdb_wal_truncate_duration_seconds",
-		Help:       "Duration of WAL truncation.",
-		Objectives: map[float64]float64{},
+		Name:        "prometheus_tsdb_wal_truncate_duration_seconds",
+		Help:        "Duration of WAL truncation.",
+		ConstLabels: constLabels,
+		Objectives:  map[float64]float64{},
 	})
 	m.walCorruptionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_wal_corruptions_total",
-		Help: "Total number of WAL corruptions.",
+		Name:        "prometheus_tsdb_wal_corruptions_total",
+		Help:        "Total number of WAL corruptions.",
+		ConstLabels: constLabels,
 	})
 	m.samplesAppended = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_samples_appended_total",
-		Help: "Total number of appended samples.",
+		Name:        "prometheus_tsdb_head_samples_appended_total",
+		Help:        "Total number of appended samples.",
+		ConstLabels: constLabels,
 	})
 	m.waterLevel = prometheus.NewCounterFunc(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_water_level",
-		Help: "Total number of water level in the head",
+		Name:        "prometheus_tsdb_head_water_level",
+		Help:        "Total number of water level in the head",
+		ConstLabels: constLabels,
 	}, func() float64 {
 		return float64(waterlevel.Get())
 	})
 	m.headTruncateFail = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_truncations_failed_total",
-		Help: "Total number of head truncations that failed.",
+		Name:        "prometheus_tsdb_head_truncations_failed_total",
+		Help:        "Total number of head truncations that failed.",
+		ConstLabels: constLabels,
 	})
 	m.headTruncateTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_head_truncations_total",
-		Help: "Total number of head truncations attempted.",
+		Name:        "prometheus_tsdb_head_truncations_total",
+		Help:        "Total number of head truncations attempted.",
+		ConstLabels: constLabels,
 	})
 	m.checkpointDeleteFail = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_checkpoint_deletions_failed_total",
-		Help: "Total number of checkpoint deletions that failed.",
+		Name:        "prometheus_tsdb_checkpoint_deletions_failed_total",
+		Help:        "Total number of checkpoint deletions that failed.",
+		ConstLabels: constLabels,
 	})
 	m.checkpointDeleteTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_checkpoint_deletions_total",
-		Help: "Total number of checkpoint deletions attempted.",
+		Name:        "prometheus_tsdb_checkpoint_deletions_total",
+		Help:        "Total number of checkpoint deletions attempted.",
+		ConstLabels: constLabels,
 	})
 	m.checkpointCreationFail = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_checkpoint_creations_failed_total",
-		Help: "Total number of checkpoint creations that failed.",
+		Name:        "prometheus_tsdb_checkpoint_creations_failed_total",
+		Help:        "Total number of checkpoint creations that failed.",
+		ConstLabels: constLabels,
 	})
 	m.checkpointCreationTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_checkpoint_creations_total",
-		Help: "Total number of checkpoint creations attempted.",
+		Name:        "prometheus_tsdb_checkpoint_creations_total",
+		Help:        "Total number of checkpoint creations attempted.",
+		ConstLabels: constLabels,
 	})
 
 	if r != nil {
@@ -287,7 +312,7 @@ func (h *Head) PostingsCardinalityStats(statsByLabelName string) *index.Postings
 // stripeSize sets the number of entries in the hash map, it must be a power of 2.
 // A larger stripeSize will allocate more memory up-front, but will increase performance when handling a large number of series.
 // A smaller stripeSize reduces the memory allocated, but can decrease performance with large number of series.
-func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int64, stripeSize int, watermark WaterMark) (*Head, error) {
+func NewHead(name string, r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int64, stripeSize int, watermark WaterMark) (*Head, error) {
 	if l == nil {
 		l = log.NewNopLogger()
 	}
@@ -295,6 +320,7 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int
 		return nil, errors.Errorf("invalid chunk range %d", chunkRange)
 	}
 	h := &Head{
+		name:            name,
 		wal:             wal,
 		logger:          l,
 		chunkRange:      chunkRange,
@@ -2319,5 +2345,5 @@ func (ss stringset) slice() []string {
 }
 
 func getMinValidTime(ts int64) int64 {
-	return rangeForStart(ts-chunkenc.MaxOffsetWindow, chunkenc.ChunkWindowMs)
+	return ts - chunkenc.MaxOffsetWindow
 }
