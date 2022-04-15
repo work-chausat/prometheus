@@ -1650,12 +1650,14 @@ func (h *Head) getOrCreate(hash uint64, l labels.Labels) (*memSeries, bool, erro
 			lset[i].Name = lb.Name
 			h.symbols.Add(lset[i].Name)
 		}
-		if value, ok := h.symbols.Get(lb.Value); ok {
-			lset[i].Value = value
-		} else {
-			lset[i].Value = lb.Value
-			h.symbols.Add(lset[i].Value)
-		}
+		//lset[i].Name = lb.Name
+		lset[i].Value = lb.Value
+		//if value, ok := h.symbols.Get(lb.Value); ok {
+		//	lset[i].Value = value
+		//} else {
+		//	lset[i].Value = lb.Value
+		//	h.symbols.Add(lset[i].Value)
+		//}
 	}
 
 	s, ok := h.getOrCreateWithID(id, hash, lset)

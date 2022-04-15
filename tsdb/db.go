@@ -511,10 +511,9 @@ func (db *DBReadOnly) Close() error {
 
 type MigratedDB struct {
 	*DB
-	Cold *DB
-
-	autoMigrate sync.Mutex
-	waiting     sync.Map
+	Cold    *DB
+	wMutex  sync.Mutex //migrated lock
+	waiting sync.Map
 }
 
 func OpenMigratedDB(rwDir string, rwOpts *Options, rDir string, rOpts *Options, l log.Logger, reg prometheus.Registerer) (mixedDB *MigratedDB, err error) {
@@ -532,7 +531,7 @@ func OpenMigratedDB(rwDir string, rwOpts *Options, rDir string, rOpts *Options, 
 		}
 		cold.autoCompact = true
 		mixedDB.Cold = cold
-		hot.migrate = mixedDB.onMigrate
+		hot.migrate = mixedDB.notifyMigrate
 	}
 
 	return mixedDB, nil
@@ -612,38 +611,43 @@ func (db *MigratedDB) Querier(mint, maxt int64) (Querier, error) {
 	}, nil
 }
 
-func (db *MigratedDB) onMigrate(uid ulid.ULID) {
-	go func(uid ulid.ULID) {
-		var err error
-		db.cmtx.Lock()
-		defer db.cmtx.Unlock()
-		if _, loaded := db.waiting.LoadOrStore(uid, struct{}{}); loaded {
-			return
-		}
-		defer db.waiting.Delete(uid)
+func (db *MigratedDB) notifyMigrate(uid ulid.ULID) {
+	db.waiting.Store(uid, struct{}{})
+	go func() {
+		db.wMutex.Lock()
+		db.wMutex.Unlock()
 
-		if !db.exists(uid) || db.head.compactable() {
-			return
-		}
+		db.waiting.Range(func(key, value interface{}) bool {
+			db.migratingBlock(key.(ulid.ULID))
+			return true
+		})
+	}()
+}
 
-		level.Info(db.logger).Log("msg", "migrate starting", "uid", uid)
-		defer func(t time.Time) {
-			if db.Cold.exists(uid) {
-				db.DB.deleteBlock(uid)
-			}
-			if err != nil {
-				level.Error(db.logger).Log("msg", "migrate failed", "uid", uid, "costTime", time.Since(t).String(), "err", err)
-			} else {
-				level.Info(db.logger).Log("msg", "migrate finish", "uid", uid, "costTime", time.Since(t).String())
-			}
-		}(time.Now())
-
-		if err = fileutil.CopyDirsSafely(filepath.Join(db.dir, uid.String()), filepath.Join(db.Cold.dir, uid.String())); err != nil {
-			err = errors.Wrapf(err, "copy dir failed")
-			return
+func (db *MigratedDB) migratingBlock(uid ulid.ULID) (err error) {
+	defer db.waiting.Delete(uid)
+	if !db.exists(uid) {
+		return
+	}
+	level.Info(db.logger).Log("msg", "migrate starting", "uid", uid)
+	defer func(t time.Time) {
+		if db.Cold.exists(uid) {
+			db.DB.deleteBlock(uid)
 		}
-		err = db.Cold.Reload()
-	}(uid)
+		if err != nil {
+			level.Error(db.logger).Log("msg", "migrate failed", "uid", uid, "costTime", time.Since(t).String(), "err", err)
+		} else {
+			level.Info(db.logger).Log("msg", "migrate finish", "uid", uid, "costTime", time.Since(t).String())
+		}
+	}(time.Now())
+
+	if err = fileutil.CopyDirsSafely(filepath.Join(db.dir, uid.String()), filepath.Join(db.Cold.dir, uid.String())); err != nil {
+		err = errors.Wrapf(err, "copy dir failed")
+		return
+	}
+	err = db.Cold.Reload()
+
+	return
 }
 
 func (db *MigratedDB) CombinesBlocks() []*Block {
