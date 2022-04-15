@@ -615,7 +615,7 @@ func (db *MigratedDB) notifyMigrate(uid ulid.ULID) {
 	db.waiting.Store(uid, struct{}{})
 	go func() {
 		db.wMutex.Lock()
-		db.wMutex.Unlock()
+		defer db.wMutex.Unlock()
 
 		db.waiting.Range(func(key, value interface{}) bool {
 			db.migratingBlock(key.(ulid.ULID))
