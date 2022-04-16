@@ -951,22 +951,21 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 			maxt: maxt - 1,
 		}}
 
-		uid, err := db.compactor.Write(db.dir, head, mint, maxt, nil)
+		uid, flushErr := db.compactor.Write(db.dir, head, mint, maxt, nil)
+		reloadErr := db.Reload()
+
 		if i == 0 {
-			db.head.mergeMinTime(err)
+			db.head.mergeMinTime(flushErr)
 		}
 
-		if err != nil {
-			return errors.Wrap(err, "persist head block")
+		if flushErr != nil {
+			return errors.Wrap(flushErr, "persist head block")
 		}
-
-		runtime.GC()
-
-		if err := db.Reload(); err != nil {
+		if reloadErr != nil {
 			if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
 				return errors.Wrapf(err, "delete persisted head block after failed db Reload:%s", uid)
 			}
-			return errors.Wrap(err, "Reload blocks")
+			return errors.Wrap(reloadErr, "Reload blocks")
 		}
 		// Compaction resulted in an empty block.
 		// Head truncating during db.Reload() depends on the persisted blocks and
