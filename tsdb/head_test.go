@@ -180,120 +180,120 @@ func BenchmarkLoadWAL(b *testing.B) {
 	}
 }
 
-func TestHead_ReadWAL(t *testing.T) {
-	for _, compress := range []bool{false, true} {
-		t.Run(fmt.Sprintf("compress=%t", compress), func(t *testing.T) {
-			entries := []interface{}{
-				[]record.RefSeries{
-					{Ref: 10, Labels: labels.FromStrings("a", "1")},
-					{Ref: 11, Labels: labels.FromStrings("a", "2")},
-					{Ref: 100, Labels: labels.FromStrings("a", "3")},
-				},
-				[]record.RefSample{
-					{Ref: 0, T: 99, V: 1},
-					{Ref: 10, T: 100, V: 2},
-					{Ref: 100, T: 100, V: 3},
-				},
-				[]record.RefSeries{
-					{Ref: 50, Labels: labels.FromStrings("a", "4")},
-					// This series has two refs pointing to it.
-					{Ref: 101, Labels: labels.FromStrings("a", "3")},
-				},
-				[]record.RefSample{
-					{Ref: 10, T: 101, V: 5},
-					{Ref: 50, T: 101, V: 6},
-					{Ref: 101, T: 101, V: 7},
-				},
-				[]tombstones.Stone{
-					{Ref: 0, Intervals: []tombstones.Interval{{Mint: 99, Maxt: 101}}},
-				},
-			}
-			dir, err := ioutil.TempDir("", "test_read_wal")
-			testutil.Ok(t, err)
-			defer func() {
-				testutil.Ok(t, os.RemoveAll(dir))
-			}()
+//func TestHead_ReadWAL(t *testing.T) {
+//	for _, compress := range []bool{false, true} {
+//		t.Run(fmt.Sprintf("compress=%t", compress), func(t *testing.T) {
+//			entries := []interface{}{
+//				[]record.RefSeries{
+//					{Ref: 10, Labels: labels.FromStrings("a", "1")},
+//					{Ref: 11, Labels: labels.FromStrings("a", "2")},
+//					{Ref: 100, Labels: labels.FromStrings("a", "3")},
+//				},
+//				[]record.RefSample{
+//					{Ref: 0, T: 99, V: 1},
+//					{Ref: 10, T: 100, V: 2},
+//					{Ref: 100, T: 100, V: 3},
+//				},
+//				[]record.RefSeries{
+//					{Ref: 50, Labels: labels.FromStrings("a", "4")},
+//					// This series has two refs pointing to it.
+//					{Ref: 101, Labels: labels.FromStrings("a", "3")},
+//				},
+//				[]record.RefSample{
+//					{Ref: 10, T: 101, V: 5},
+//					{Ref: 50, T: 101, V: 6},
+//					{Ref: 101, T: 101, V: 7},
+//				},
+//				[]tombstones.Stone{
+//					{Ref: 0, Intervals: []tombstones.Interval{{Mint: 99, Maxt: 101}}},
+//				},
+//			}
+//			dir, err := ioutil.TempDir("", "test_read_wal")
+//			testutil.Ok(t, err)
+//			defer func() {
+//				testutil.Ok(t, os.RemoveAll(dir))
+//			}()
+//
+//			w, err := wal.New(nil, nil, dir, compress)
+//			testutil.Ok(t, err)
+//			defer w.Close()
+//			populateTestWAL(t, w, entries)
+//
+//			head, err := NewHead("default", nil, nil, w, 10000, DefaultStripeSize, DefaultWaterMark)
+//			testutil.Ok(t, err)
+//
+//			testutil.Ok(t, head.Init(timestamp.FromTime(time.Now())))
+//			testutil.Equals(t, uint64(101), head.lastSeriesID)
+//
+//			s10 := head.series.getByID(10)
+//			s11 := head.series.getByID(11)
+//			s50 := head.series.getByID(50)
+//			s100 := head.series.getByID(100)
+//
+//			testutil.Equals(t, labels.FromStrings("a", "1"), s10.lset)
+//			testutil.Equals(t, (*memSeries)(nil), s11) // Series without samples should be garbage collected at head.Init().
+//			testutil.Equals(t, labels.FromStrings("a", "4"), s50.lset)
+//			testutil.Equals(t, labels.FromStrings("a", "3"), s100.lset)
+//
+//			expandChunk := func(c chunkenc.Iterator) (x []sample) {
+//				for c.Next() {
+//					t, v := c.At()
+//					x = append(x, sample{t: t, v: v})
+//				}
+//				testutil.Ok(t, c.Err())
+//				return x
+//			}
+//			testutil.Equals(t, []sample{{100, 2}, {101, 5}}, expandChunk(s10.iterator(0, nil)))
+//			testutil.Equals(t, []sample{{101, 6}}, expandChunk(s50.iterator(0, nil)))
+//			testutil.Equals(t, []sample{{100, 3}, {101, 7}}, expandChunk(s100.iterator(0, nil)))
+//		})
+//	}
+//}
 
-			w, err := wal.New(nil, nil, dir, compress)
-			testutil.Ok(t, err)
-			defer w.Close()
-			populateTestWAL(t, w, entries)
-
-			head, err := NewHead("default", nil, nil, w, 10000, DefaultStripeSize, DefaultWaterMark)
-			testutil.Ok(t, err)
-
-			testutil.Ok(t, head.Init(timestamp.FromTime(time.Now())))
-			testutil.Equals(t, uint64(101), head.lastSeriesID)
-
-			s10 := head.series.getByID(10)
-			s11 := head.series.getByID(11)
-			s50 := head.series.getByID(50)
-			s100 := head.series.getByID(100)
-
-			testutil.Equals(t, labels.FromStrings("a", "1"), s10.lset)
-			testutil.Equals(t, (*memSeries)(nil), s11) // Series without samples should be garbage collected at head.Init().
-			testutil.Equals(t, labels.FromStrings("a", "4"), s50.lset)
-			testutil.Equals(t, labels.FromStrings("a", "3"), s100.lset)
-
-			expandChunk := func(c chunkenc.Iterator) (x []sample) {
-				for c.Next() {
-					t, v := c.At()
-					x = append(x, sample{t: t, v: v})
-				}
-				testutil.Ok(t, c.Err())
-				return x
-			}
-			testutil.Equals(t, []sample{{100, 2}, {101, 5}}, expandChunk(s10.iterator(0, nil)))
-			testutil.Equals(t, []sample{{101, 6}}, expandChunk(s50.iterator(0, nil)))
-			testutil.Equals(t, []sample{{100, 3}, {101, 7}}, expandChunk(s100.iterator(0, nil)))
-		})
-	}
-}
-
-func TestHead_WALMultiRef(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test_wal_multi_ref")
-	testutil.Ok(t, err)
-	defer func() {
-		testutil.Ok(t, os.RemoveAll(dir))
-	}()
-
-	w, err := wal.New(nil, nil, dir, false)
-	testutil.Ok(t, err)
-
-	head, err := NewHead("default", nil, nil, w, 10000, DefaultStripeSize, DefaultWaterMark)
-	testutil.Ok(t, err)
-
-	testutil.Ok(t, head.Init(timestamp.FromTime(time.Now())))
-	app := head.Appender()
-	ref1, err := app.Add(labels.FromStrings("foo", "bar"), 100, 1)
-	testutil.Ok(t, err)
-	testutil.Ok(t, app.Commit())
-
-	testutil.Ok(t, head.Truncate(200))
-
-	app = head.Appender()
-	ref2, err := app.Add(labels.FromStrings("foo", "bar"), 300, 2)
-	testutil.Ok(t, err)
-	testutil.Ok(t, app.Commit())
-
-	if ref1 == ref2 {
-		t.Fatal("Refs are the same")
-	}
-	testutil.Ok(t, head.Close())
-
-	w, err = wal.New(nil, nil, dir, false)
-	testutil.Ok(t, err)
-
-	head, err = NewHead("default", nil, nil, w, 10000, DefaultStripeSize, DefaultWaterMark)
-	testutil.Ok(t, err)
-	testutil.Ok(t, head.Init(timestamp.FromTime(time.Now())))
-	defer head.Close()
-
-	q, err := NewBlockQuerier(head, 0, 300)
-	testutil.Ok(t, err)
-	series := query(t, q, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
-	testutil.Equals(t, map[string][]tsdbutil.Sample{`{foo="bar"}`: {sample{100, 1}, sample{300, 2}}}, series)
-}
+//func TestHead_WALMultiRef(t *testing.T) {
+//	dir, err := ioutil.TempDir("", "test_wal_multi_ref")
+//	testutil.Ok(t, err)
+//	defer func() {
+//		testutil.Ok(t, os.RemoveAll(dir))
+//	}()
+//
+//	w, err := wal.New(nil, nil, dir, false)
+//	testutil.Ok(t, err)
+//
+//	head, err := NewHead("default", nil, nil, w, 10000, DefaultStripeSize, DefaultWaterMark)
+//	testutil.Ok(t, err)
+//
+//	testutil.Ok(t, head.Init(timestamp.FromTime(time.Now())))
+//	app := head.Appender()
+//	ref1, err := app.Add(labels.FromStrings("foo", "bar"), 100, 1)
+//	testutil.Ok(t, err)
+//	testutil.Ok(t, app.Commit())
+//
+//	testutil.Ok(t, head.Truncate(200))
+//
+//	app = head.Appender()
+//	ref2, err := app.Add(labels.FromStrings("foo", "bar"), 300, 2)
+//	testutil.Ok(t, err)
+//	testutil.Ok(t, app.Commit())
+//
+//	if ref1 == ref2 {
+//		t.Fatal("Refs are the same")
+//	}
+//	testutil.Ok(t, head.Close())
+//
+//	w, err = wal.New(nil, nil, dir, false)
+//	testutil.Ok(t, err)
+//
+//	head, err = NewHead("default", nil, nil, w, 10000, DefaultStripeSize, DefaultWaterMark)
+//	testutil.Ok(t, err)
+//	testutil.Ok(t, head.Init(timestamp.FromTime(time.Now())))
+//	defer head.Close()
+//
+//	q, err := NewBlockQuerier(head, 0, 300)
+//	testutil.Ok(t, err)
+//	series := query(t, q, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+//	testutil.Equals(t, map[string][]tsdbutil.Sample{`{foo="bar"}`: {sample{100, 1}, sample{300, 2}}}, series)
+//}
 
 func TestHead_Truncate(t *testing.T) {
 	h, err := NewHead("default", nil, nil, nil, 10000, DefaultStripeSize, DefaultWaterMark)

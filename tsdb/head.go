@@ -937,7 +937,7 @@ func (h *Head) appender() *headAppender {
 
 // Mint allowed to be added to the head
 func (h *Head) MinValidTime() int64 {
-	if PointsOutOfOrderMode {
+	if chunkenc.PointsOutOfOrderMode {
 		return getMinValidTime(h.maxTime)
 	} else {
 		return h.maxTime - h.chunkRange/2
@@ -1906,7 +1906,7 @@ func newMemSeries(lset labels.Labels, id uint64, baseTime int64) *memSeries {
 		headCid:  -1,
 		encoding: chunkenc.EncXOR,
 	}
-	if PointsOutOfOrderMode {
+	if chunkenc.PointsOutOfOrderMode {
 		s.encoding = chunkenc.EncUnorderedXOR
 	}
 

@@ -118,9 +118,34 @@ func (c *XORChunk) iterator(it Iterator) *xorIterator {
 	}
 }
 
+func (c *XORChunk) iteratorWithCopyData(it Iterator) *xorIterator {
+	if xorIter, ok := it.(*xorIterator); ok {
+		dst := xorIter.br.bytes()
+		if len(dst) < len(c.b.bytes()) {
+			dst = make([]byte, len(c.b.bytes()))
+		}
+		copy(dst, c.b.bytes())
+
+		xorIter.Reset(dst)
+		return xorIter
+	}
+
+	dst := make([]byte, len(c.b.bytes()))
+	copy(dst, c.b.bytes())
+
+	return &xorIterator{
+		br:       newBReader(dst[2:]),
+		numTotal: binary.BigEndian.Uint16(dst),
+	}
+}
+
 // Iterator implements the Chunk interface.
 func (c *XORChunk) Iterator(it Iterator) Iterator {
-	return c.iterator(it)
+	//if PointsOutOfOrderMode {
+	return c.iteratorWithCopyData(it)
+	//} else {
+	//	return c.iterator(it)
+	//}
 }
 
 type xorAppender struct {

@@ -49,8 +49,7 @@ const (
 )
 
 var (
-	PointsOutOfOrderMode = true
-	HeadMaxNumSeries     = math.MaxInt64
+	HeadMaxNumSeries = math.MaxInt64
 )
 
 // DefaultOptions used for the DB. They are sane for setups using

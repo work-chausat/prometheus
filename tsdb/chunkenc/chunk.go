@@ -22,9 +22,10 @@ import (
 )
 
 var (
-	BaseTime        = int64(1636560000000)
-	MaxOffsetWindow = int64((3 * time.Hour) / (time.Millisecond / time.Nanosecond))
-	ChunkWindowMs   = int64(30 * time.Minute / (time.Millisecond / time.Nanosecond))
+	BaseTime             = int64(1636560000000)
+	MaxOffsetWindow      = int64((3 * time.Hour) / (time.Millisecond / time.Nanosecond))
+	ChunkWindowMs        = int64(30 * time.Minute / (time.Millisecond / time.Nanosecond))
+	PointsOutOfOrderMode = true
 )
 
 // Encoding is the identifier for a chunk encoding.

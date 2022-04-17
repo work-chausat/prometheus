@@ -2,15 +2,20 @@ package chunkenc
 
 import (
 	"github.com/prometheus/prometheus/tsdb/waterlevel"
+	"math/rand"
+	"sync"
 	"sync/atomic"
 )
 
 const outOfOrderSize = 1<<4 - 1
+const stripeSize = 1024
 
 var UnOrderedTotal uint64
+var sortedLocker = make([]stripeLock, stripeSize)
 
 type UnorderedXORChunk struct {
 	sortedPoints *sortedPoints
+	lockerIndex  uint32
 
 	xorChunk *XORChunk
 	xorApp   *xorAppender
@@ -22,8 +27,9 @@ func NewUnorderedXORChunk() *UnorderedXORChunk {
 
 	app, _ := xorChunk.Appender()
 	return &UnorderedXORChunk{
-		xorChunk: xorChunk,
-		xorApp:   app.(*xorAppender),
+		xorChunk:    xorChunk,
+		lockerIndex: uint32(rand.Int31n(stripeSize)),
+		xorApp:      app.(*xorAppender),
 	}
 }
 
@@ -47,11 +53,13 @@ func (c *UnorderedXORChunk) merge(force bool) error {
 	c.xorChunk = xorChunk
 	c.xorApp = app.(*xorAppender)
 
+	sortedLocker[c.lockerIndex].Lock()
 	if force {
 		c.sortedPoints = nil
 	} else {
 		*c.sortedPoints = (*c.sortedPoints)[:0]
 	}
+	sortedLocker[c.lockerIndex].Unlock()
 
 	return nil
 }
@@ -82,10 +90,13 @@ func (c *UnorderedXORChunk) Append(t int64, v float64) {
 		c.xorApp.Append(t, v)
 		waterlevel.Delta(len(c.xorChunk.Bytes()) - bytesNum)
 	} else {
+		sortedLocker[c.lockerIndex].Lock()
 		if c.sortedPoints == nil {
 			c.sortedPoints = new(sortedPoints)
 		}
 		c.sortedPoints.insertOrUpdate(t, v)
+		sortedLocker[c.lockerIndex].Unlock()
+
 		atomic.AddUint64(&UnOrderedTotal, 1)
 	}
 
@@ -98,19 +109,23 @@ func (c *UnorderedXORChunk) Iterator(it Iterator) Iterator {
 
 func (c *UnorderedXORChunk) mergeIter(it Iterator, copyOnWrite bool) Iterator {
 	if c.sortedPoints == nil || len(*c.sortedPoints) == 0 {
-		return c.xorChunk.iterator(it)
+		return c.xorChunk.Iterator(it)
 	}
 
 	var points []Point
-	if copyOnWrite {
-		points = make([]Point, len(*c.sortedPoints))
-		copy(points, *c.sortedPoints)
-	} else {
-		points = *c.sortedPoints
+	sortedLocker[c.lockerIndex].RLock()
+	if c.sortedPoints != nil && len(*c.sortedPoints) > 0 {
+		if copyOnWrite {
+			points = make([]Point, len(*c.sortedPoints))
+			copy(points, *c.sortedPoints)
+		} else {
+			points = *c.sortedPoints
+		}
 	}
+	sortedLocker[c.lockerIndex].RUnlock()
 
 	return &mergeIterator{
-		aIt: c.xorChunk.iterator(it),
+		aIt: c.xorChunk.Iterator(it),
 		bIt: &sortedSampleIterator{
 			points: points,
 			i:      -1,
@@ -168,4 +183,10 @@ func (p *sortedSampleIterator) Next() bool {
 		return true
 	}
 	return false
+}
+
+type stripeLock struct {
+	sync.RWMutex
+	// Padding to avoid multiple locks being on the same cache line.
+	_ [40]byte
 }

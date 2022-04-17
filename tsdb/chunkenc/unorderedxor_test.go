@@ -123,3 +123,18 @@ func BenchmarkCopy(b *testing.B) {
 		copy(dst, source)
 	}
 }
+
+func BenchmarkArray(b *testing.B) {
+	src := make([]byte, 128)
+	dst := make([]byte, 0, len(src))
+	b.ReportAllocs()
+	b.ResetTimer()
+	//println("bbbb")
+	for i := 0; i < b.N; i++ {
+		//if len(dst) < len(src) { //4.9
+		//	dst = make([]byte, len(src))
+		//}
+		dst = make([]byte, len(src)) //32.34
+		copy(dst, src)
+	}
+}
