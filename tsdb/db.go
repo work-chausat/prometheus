@@ -17,6 +17,7 @@ package tsdb
 import (
 	"context"
 	"fmt"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 	"io"
 	"io/ioutil"
 	"math"
@@ -62,6 +63,7 @@ var DefaultOptions = &Options{
 	AllowOverlappingBlocks: false,
 	WALCompression:         false,
 	StripeSize:             DefaultStripeSize,
+	WarmUpDBOnOpening:      true,
 	WaterMarkCompact:       DefaultWaterMark,
 }
 
@@ -100,7 +102,9 @@ type Options struct {
 	// StripeSize is the size in entries of the series hash map. Reducing the size will save memory but impact perfomance.
 	StripeSize int
 
-	WaterMarkCompact WaterMark
+	WarmUpDBOnOpening  bool
+	ForceFlushResident bool
+	WaterMarkCompact   WaterMark
 }
 
 // Appender allows appending a batch of data. It must be completed with a
@@ -787,10 +791,43 @@ func OpenDB(name, dir string, l log.Logger, reg prometheus.Registerer, opts *Opt
 			return nil, errors.Wrap(err, "repair corrupted WAL")
 		}
 	}
+	if opts.WarmUpDBOnOpening {
+		db.warmUpDataBase()
+	}
 
 	go db.run()
-
 	return db, nil
+}
+
+func (db *DB) warmUpDataBase() error {
+	if db.name != "hot" || len(db.blocks) == 0 {
+		return nil
+	}
+	level.Info(db.logger).Log("msg", "starting warm up database……")
+	b := db.blocks[len(db.blocks)-1]
+	ir, err := b.Index()
+	if err != nil {
+		return err
+	}
+	defer ir.Close()
+
+	p, err := ir.Postings("", "") // The special all key.
+	if err != nil {
+		return err
+	}
+	lbls := labels.Labels{}
+	chks := []chunks.Meta{}
+	for p.Next() {
+		if err = ir.Series(p.At(), &lbls, &chks); err != nil {
+			return err
+		}
+		lset := make(labels.Labels, lbls.Len())
+		copy(lset, lbls)
+
+		db.head.getOrCreate(lset.Hash(), lset)
+	}
+
+	return nil
 }
 
 // Dir returns the directory of the database.
@@ -821,9 +858,11 @@ func (db *DB) run() {
 
 			db.autoCompactMtx.Lock()
 			if db.autoCompact {
-				maxInterval := time.Duration(db.head.chunkRange*4) * time.Millisecond
-				forceCompact := time.Now().After(db.latestCompactTime.Add(maxInterval))
-				if err := db.Compact(forceCompact); err != nil {
+				forceFlush := false
+				if db.opts.ForceFlushResident {
+					forceFlush = time.Now().After(db.latestCompactTime.Add(time.Duration(db.head.chunkRange*4) * time.Millisecond))
+				}
+				if err := db.Compact(forceFlush); err != nil {
 					level.Error(db.logger).Log("msg", "compaction failed", "err", err)
 					backoff = exponential(backoff, 1*time.Second, 1*time.Minute)
 				} else {
@@ -969,7 +1008,7 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 		// Compaction resulted in an empty block.
 		// Head truncating during db.Reload() depends on the persisted blocks and
 		// in this case no new block will be persisted so manually truncate the head.
-		db.head.gc(maxt, false)
+		db.head.gc(maxt, false, false)
 		runtime.GC()
 	}
 

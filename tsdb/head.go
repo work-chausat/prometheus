@@ -636,7 +636,7 @@ func (h *Head) loadWAL(r *wal.Reader, multiRef map[uint64]uint64) (err error) {
 func (h *Head) Init(minValidTime int64) error {
 	h.minValidTime = minValidTime
 	defer h.postings.EnsureOrder()
-	defer h.gc(minValidTime, true) // After loading the wal remove the obsolete data from the head.
+	defer h.gc(minValidTime, true, false) // After loading the wal remove the obsolete data from the head.
 
 	if h.wal == nil {
 		return nil
@@ -697,7 +697,7 @@ func (h *Head) Init(minValidTime int64) error {
 }
 
 // Truncate removes old data before mint from the head.
-func (h *Head) Truncate(mint int64) (err error) {
+func (h *Head) Truncate(mint int64, keepPosting bool) (err error) {
 	defer func() {
 		if err != nil {
 			h.metrics.headTruncateFail.Inc()
@@ -722,7 +722,7 @@ func (h *Head) Truncate(mint int64) (err error) {
 
 	h.metrics.headTruncateTotal.Inc()
 
-	h.gc(mint, true)
+	h.gc(mint, true, keepPosting)
 
 	if h.wal == nil {
 		return nil
@@ -1187,7 +1187,7 @@ func (h *Head) Delete(mint, maxt int64, ms ...*labels.Matcher) error {
 }
 
 // gc removes data before the minimum timestamp from the head.
-func (h *Head) gc(mint int64, force bool) {
+func (h *Head) gc(mint int64, force, keepPosting bool) {
 	start := time.Now()
 	defer func() {
 		level.Info(h.logger).Log("msg", "head GC completed", "duration", time.Since(start))
@@ -1200,7 +1200,7 @@ func (h *Head) gc(mint int64, force bool) {
 	// deleted entirely.
 
 	atomic.StoreInt64(&h.minTime, math.MaxInt64)
-	deleted, chunksRemoved, actualMinT := h.series.gc(mint, force)
+	deleted, chunksRemoved, actualMinT := h.series.gc(mint, force, keepPosting)
 	h.updateMinTime(rangeForStart(actualMinT, h.chunkRange))
 
 	if !initialize {
@@ -1774,7 +1774,7 @@ func newStripeSeries(stripeSize int) *stripeSeries {
 
 // gc garbage collects old chunks that are strictly before mint and removes
 // series entirely that have no chunks left.
-func (s *stripeSeries) gc(mint int64, force bool) (map[uint64]struct{}, int, int64) {
+func (s *stripeSeries) gc(mint int64, force, keepPosting bool) (map[uint64]struct{}, int, int64) {
 	var (
 		deleted       = map[uint64]struct{}{}
 		rmChunks      = 0
@@ -1791,7 +1791,7 @@ func (s *stripeSeries) gc(mint int64, force bool) (map[uint64]struct{}, int, int
 				chunksRemoved, seriesMinTime := series.truncateChunkBefore(mint, force)
 				rmChunks += chunksRemoved
 
-				if len(series.chunks) > 0 || series.pendingCommit {
+				if len(series.chunks) > 0 || series.pendingCommit || keepPosting {
 					if seriesMinTime < actualMinTime {
 						actualMinTime = seriesMinTime
 					}
