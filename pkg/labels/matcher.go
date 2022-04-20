@@ -68,6 +68,19 @@ func NewMatcher(t MatchType, n, v string) (*Matcher, error) {
 	return m, nil
 }
 
+func (m Matcher) RegexpWrapperFromPrometheus() string {
+	if m.Type != MatchRegexp && m.Type != MatchNotRegexp {
+		return m.Value
+	}
+	if len(m.Value) < 6 {
+		return m.Value
+	}
+	if m.Value[:4] == "^(?:" && m.Value[len(m.Value)-2:] == ")$" {
+		return m.Value
+	}
+	return m.re.String()
+}
+
 // MustNewMatcher panics on error - only for use in tests!
 func MustNewMatcher(mt MatchType, name, val string) *Matcher {
 	m, err := NewMatcher(mt, name, val)
