@@ -781,7 +781,7 @@ func OpenDB(name, dir string, l log.Logger, reg prometheus.Registerer, opts *Opt
 	blocks := db.Blocks()
 	minValidTime := int64(math.MinInt64)
 	if len(blocks) > 0 {
-		minValidTime = getMinValidTime(blocks[len(blocks)-1].Meta().MaxTime)
+		minValidTime = blocks[len(blocks)-1].Meta().MaxTime - db.head.maxOffsetWindow
 	}
 
 	if initErr := db.head.Init(minValidTime); initErr != nil {
@@ -972,7 +972,7 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 		//maybe middle chunks is all empty
 		//maybe tail chunks can compact
 		//flush blocks at the most
-		if maxt < db.head.MinTime() || mint > db.head.MaxTime() || (i != 0 && i >= int(chunkenc.MaxOffsetWindow/db.head.chunkRange)) {
+		if maxt < db.head.MinTime() || mint > db.head.MaxTime() || (i != 0 && i >= int(db.head.maxOffsetWindow/db.head.chunkRange)) {
 			level.Info(db.logger).Log("maxt", maxt, "mint", mint, "headMin", db.head.MinTime(), "headMax", db.head.MaxTime(), "i", i)
 			break
 		}
@@ -1010,6 +1010,9 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 		// in this case no new block will be persisted so manually truncate the head.
 		db.head.gc(maxt, false, false)
 		runtime.GC()
+		if uid.Compare(ulid.ULID{}) == 0 {
+			break
+		}
 	}
 
 	// Check for compactions of multiple blocks.
@@ -1040,7 +1043,6 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 			}
 			return errors.Wrap(err, "Reload blocks")
 		}
-		runtime.GC()
 
 		if db.head.compactable() {
 			select {

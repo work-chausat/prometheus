@@ -73,17 +73,17 @@ type Head struct {
 	// See https://golang.org/pkg/sync/atomic/#pkg-note-BUG for more info.
 	name             string
 	chunkRange       int64
+	maxOffsetWindow  int64
 	numSeries        uint64
 	minTime, maxTime int64 // Current min and max of the samples included in the head.
 	minValidTime     int64 // Mint allowed to be added to the head. It shouldn't be lower than the maxt of the last persisted block.
 	lastSeriesID     uint64
-
-	metrics    *headMetrics
-	wal        *wal.WAL
-	logger     log.Logger
-	appendPool sync.Pool
-	seriesPool sync.Pool
-	bytesPool  sync.Pool
+	metrics          *headMetrics
+	wal              *wal.WAL
+	logger           log.Logger
+	appendPool       sync.Pool
+	seriesPool       sync.Pool
+	bytesPool        sync.Pool
 
 	// All series addressable by their ID or hash.
 	series *stripeSeries
@@ -333,6 +333,7 @@ func NewHead(name string, r prometheus.Registerer, l log.Logger, wal *wal.WAL, c
 		tombstones:      tombstones.NewMemTombstones(),
 		deleted:         map[uint64]int{},
 		watermark:       watermark,
+		maxOffsetWindow: chunkRange / 2,
 	}
 	h.metrics = newHeadMetrics(h, r)
 
@@ -696,6 +697,16 @@ func (h *Head) Init(minValidTime int64) error {
 	return nil
 }
 
+func (h *Head) MaxOffsetWindow(offsetWindow int64) {
+	for {
+		lt := atomic.LoadInt64(&h.maxOffsetWindow)
+		if atomic.CompareAndSwapInt64(&h.maxOffsetWindow, lt, offsetWindow) {
+			break
+		}
+	}
+	return
+}
+
 // Truncate removes old data before mint from the head.
 func (h *Head) Truncate(mint int64, keepPosting bool) (err error) {
 	defer func() {
@@ -807,7 +818,7 @@ func (h *Head) initTime(t int64) (initialized bool) {
 	// Ensure that max time is initialized to at least the min time we just set.
 	// Concurrent appenders may already have set it to a higher value.
 	atomic.CompareAndSwapInt64(&h.minTime, math.MaxInt64, t)
-	atomic.CompareAndSwapInt64(&h.minValidTime, math.MinInt64, getMinValidTime(t))
+	atomic.CompareAndSwapInt64(&h.minValidTime, math.MinInt64, h.MinValidTime())
 
 	return true
 }
@@ -938,7 +949,7 @@ func (h *Head) appender() *headAppender {
 // Mint allowed to be added to the head
 func (h *Head) MinValidTime() int64 {
 	if chunkenc.PointsOutOfOrderMode {
-		return getMinValidTime(h.maxTime)
+		return h.maxTime - h.maxOffsetWindow
 	} else {
 		return h.maxTime - h.chunkRange/2
 	}
@@ -2344,8 +2355,4 @@ func (ss stringset) slice() []string {
 	}
 	sort.Strings(slice)
 	return slice
-}
-
-func getMinValidTime(ts int64) int64 {
-	return ts - chunkenc.MaxOffsetWindow
 }
