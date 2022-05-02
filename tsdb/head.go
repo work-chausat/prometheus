@@ -102,8 +102,8 @@ type Head struct {
 	cardinalityCache      *index.PostingsStats // posting stats cache which will expire after 30sec
 	lastPostingsStatsCall time.Duration        // last posting stats call (PostingsCardinalityStats()) time for caching
 
-	splittedMinTime int64
-	watermark       WaterMark
+	minTimeCopy int64
+	watermark   WaterMark
 }
 
 type headMetrics struct {
@@ -326,7 +326,7 @@ func NewHead(name string, r prometheus.Registerer, l log.Logger, wal *wal.WAL, c
 		chunkRange:      chunkRange,
 		minTime:         math.MaxInt64,
 		maxTime:         math.MinInt64,
-		splittedMinTime: math.MaxInt64,
+		minTimeCopy:     math.MaxInt64,
 		series:          newStripeSeries(stripeSize),
 		symbols:         tsdbutil.NewStringBank(1024),
 		postings:        index.NewUnorderedMemPostings(),
@@ -408,15 +408,38 @@ func (h *Head) updateMinMaxTime(mint, maxt int64) {
 	}
 }
 
-//when calling this method, you must confirm data in head is less than mint.
-//
-func (h *Head) updateMinTime(mint int64) {
+func (h *Head) minTimeBeforeGC(tempTime int64) {
+	for {
+		mint := atomic.LoadInt64(&h.minTime)
+		if atomic.CompareAndSwapInt64(&h.minTime, mint, tempTime) {
+			h.minTimeCopy = mint
+			break
+		}
+	}
+}
+
+func (h *Head) minTimeAfterGC(mint int64) {
 	for {
 		lt := atomic.LoadInt64(&h.minTime)
 		if mint >= lt {
+			h.minTimeCopy = math.MaxInt64
 			break
 		}
 		if atomic.CompareAndSwapInt64(&h.minTime, lt, mint) {
+			h.minTimeCopy = math.MaxInt64
+			break
+		}
+	}
+}
+
+//when calling this method, you must confirm data in head is less than mint.
+func (h *Head) updateMinTime(actualMint int64) {
+	for {
+		lt := atomic.LoadInt64(&h.minTime)
+		if actualMint >= lt {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&h.minTime, lt, actualMint) {
 			break
 		}
 	}
@@ -1210,9 +1233,9 @@ func (h *Head) gc(mint int64, force, keepPosting bool) {
 	// Drop old chunks and remember series IDs and hashes if they can be
 	// deleted entirely.
 
-	atomic.StoreInt64(&h.minTime, math.MaxInt64)
+	h.minTimeBeforeGC(math.MaxInt64)
 	deleted, chunksRemoved, actualMinT := h.series.gc(mint, force, keepPosting)
-	h.updateMinTime(rangeForStart(actualMinT, h.chunkRange))
+	h.minTimeAfterGC(rangeForStart(actualMinT, h.chunkRange))
 
 	if !initialize {
 		level.Debug(h.logger).Log("msg", "update minTime", "mint", mint)
@@ -1304,7 +1327,7 @@ func (h *Head) splitMinTime() int64 {
 		maxt = rangeForTimestamp(mint, h.chunkRange)
 
 		if atomic.CompareAndSwapInt64(&h.minTime, mint, maxt) {
-			h.splittedMinTime = mint
+			h.minTimeCopy = mint
 			break
 		}
 	}
@@ -1314,9 +1337,9 @@ func (h *Head) splitMinTime() int64 {
 func (h *Head) mergeMinTime(err error) int64 {
 	if err != nil {
 		for {
-			if minTime := atomic.LoadInt64(&h.minTime); minTime > h.splittedMinTime {
-				level.Info(h.logger).Log("msg", "merge minTime", "mint", h.splittedMinTime, "err", err)
-				if atomic.CompareAndSwapInt64(&h.minTime, minTime, h.splittedMinTime) {
+			if minTime := atomic.LoadInt64(&h.minTime); minTime > h.minTimeCopy {
+				level.Info(h.logger).Log("msg", "merge minTime", "mint", h.minTimeCopy, "err", err)
+				if atomic.CompareAndSwapInt64(&h.minTime, minTime, h.minTimeCopy) {
 					break
 				}
 			} else {
@@ -1324,14 +1347,14 @@ func (h *Head) mergeMinTime(err error) int64 {
 			}
 		}
 	}
-	h.splittedMinTime = math.MaxInt64
+	h.minTimeCopy = math.MaxInt64
 
 	return atomic.LoadInt64(&h.minTime)
 }
 
 // MinTime returns the lowest time bound on visible data in the head.
 func (h *Head) MinTime() int64 {
-	return min(atomic.LoadInt64(&h.minTime), atomic.LoadInt64(&h.splittedMinTime))
+	return min(atomic.LoadInt64(&h.minTime), atomic.LoadInt64(&h.minTimeCopy))
 }
 
 // MaxTime returns the highest timestamp seen in data of the head.
