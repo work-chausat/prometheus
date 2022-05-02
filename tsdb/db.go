@@ -1053,6 +1053,7 @@ func (db *DB) CompactHead(forceFlush bool) (err error) {
 func (db *DB) compactBlocks() (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
+	defer db.recover(&err)
 
 	// Check for compactions of multiple blocks.
 	for {
@@ -1084,6 +1085,23 @@ func (db *DB) compactBlocks() (err error) {
 		}
 	}
 	return nil
+}
+
+func (db *DB) recover(errp *error) {
+	e := recover()
+	if e == nil {
+		return
+	}
+	if err, ok := e.(runtime.Error); ok {
+		// Print the stack trace but do not inhibit the running application.
+		buf := make([]byte, 64<<10)
+		buf = buf[:runtime.Stack(buf, false)]
+
+		level.Error(db.logger).Log("msg", "runtime panic in parser", "err", e, "stacktrace", string(buf))
+		*errp = fmt.Errorf("unexpected error: %s", err)
+	} else {
+		*errp = e.(error)
+	}
 }
 
 // getBlock iterates a given block range to find a block by a given id.

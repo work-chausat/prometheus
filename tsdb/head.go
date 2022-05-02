@@ -62,6 +62,7 @@ var (
 )
 
 var DefaultWaterMark = WaterMark{Low: 1 << 26 /*64MB*/, High: math.MaxInt64}
+var MaxMemoryChuckId = int64(1<<24 - 1)
 
 type WaterMark struct {
 	Low, High int64
@@ -1420,7 +1421,7 @@ func (h *headChunkReader) Chunk(ref uint64) (chunkenc.Chunk, error) {
 	}
 
 	s.Lock()
-	c := s.chunk(int(cid))
+	c := s.chunk(int64(cid))
 
 	// This means that the chunk has been garbage collected or is outside
 	// the specified range.
@@ -1433,14 +1434,14 @@ func (h *headChunkReader) Chunk(ref uint64) (chunkenc.Chunk, error) {
 	return &safeChunk{
 		memChunk: c,
 		s:        s,
-		cid:      int(cid),
+		cid:      int64(cid),
 	}, nil
 }
 
 type safeChunk struct {
 	*memChunk
 	s          *memSeries
-	cid        int
+	cid        int64
 	bytes      []byte
 	numSamples int
 }
@@ -1561,22 +1562,24 @@ func (h *headIndexReader) Series(ref uint64, lbls *labels.Labels, chks *[]chunks
 	defer s.Unlock()
 
 	*chks = (*chks)[:0]
-	cid := s.headCid
 
-	for c := s.chunk(cid); c != nil; {
+	for _, c := range s.chunks {
 		// Do not expose chunks that are outside of the specified range.
-		if c.OverlapsClosedInterval(h.mint, h.maxt) {
-			*chks = append(*chks, chunks.Meta{
-				MinTime: c.minTime(),
-				MaxTime: c.maxTime(),
-				Ref:     packChunkID(s.ref, uint64(cid)),
-				Term:    math.MaxInt64,
-			})
+		if c == nil || !c.OverlapsClosedInterval(h.mint, h.maxt) {
+			continue
 		}
-		cid = c.nextCid
-		c = s.chunk(cid)
+		// Set the head chunks as open (being appended to).
+		//maxTime := c.maxTime
+		//if s.headChunk == c {
+		//	maxTime = math.MaxInt64
+		//}
+
+		*chks = append(*chks, chunks.Meta{
+			MinTime: c.minTime(),
+			MaxTime: c.maxTime(),
+			Ref:     packChunkID(s.ref, uint64(c.cid)),
+		})
 	}
-	reverse(chks)
 
 	return nil
 }
@@ -1601,7 +1604,7 @@ func (h *compactHeadChunkReader) Chunk(ref uint64) (chunkenc.Chunk, error) {
 	}
 
 	s.Lock()
-	c := s.chunk(int(cid))
+	c := s.chunk(int64(cid))
 
 	// This means that the chunk has been garbage collected or is outside
 	// the specified range.
@@ -1638,27 +1641,28 @@ func (h *compactHeadIndexReader) Series(ref uint64, lbls *labels.Labels, chks *[
 	defer s.Unlock()
 
 	*chks = (*chks)[:0]
-	cid := s.headCid
-
-	for c := s.chunk(cid); c != nil; {
+	for _, c := range s.chunks {
 		// Do not expose chunks that are outside of the specified range.
-		if c.OverlapsClosedInterval(h.mint, h.maxt) {
-			stale := c.cut(h.withMutable)
-
-			if stale != nil && stale.OverlapsClosedInterval(h.mint, h.maxt) {
-				*chks = append(*chks, chunks.Meta{
-					MinTime: c.minTime(),
-					MaxTime: c.maxTime(),
-					Ref:     packChunkID(s.ref, uint64(cid)),
-					Term:    math.MaxInt64,
-				})
-			}
+		if c == nil || !c.OverlapsClosedInterval(h.mint, h.maxt) {
+			continue
 		}
-		cid = c.nextCid
-		c = s.chunk(cid)
-	}
+		// Set the head chunks as open (being appended to).
+		//maxTime := c.maxTime
+		//if s.headChunk == c {
+		//	maxTime = math.MaxInt64
+		//}
 
-	reverse(chks)
+		stale := c.cut(h.withMutable)
+
+		if stale != nil && stale.OverlapsClosedInterval(h.mint, h.maxt) {
+			*chks = append(*chks, chunks.Meta{
+				MinTime: c.minTime(),
+				MaxTime: c.maxTime(),
+				Ref:     packChunkID(s.ref, uint64(c.cid)),
+				Term:    math.MaxInt64,
+			})
+		}
+	}
 	return nil
 }
 
@@ -1948,26 +1952,27 @@ func newMemSeries(lset labels.Labels, id uint64, baseTime int64) *memSeries {
 }
 
 func (s *memSeries) minTime() int64 {
-	chk := s.head()
-	if chk == nil {
+	if len(s.chunks) == 0 {
 		return math.MinInt64
 	}
-	for true {
-		prev := s.nextChunk(chk)
-		if prev != nil {
-			chk = prev
+	for _, chk := range s.chunks {
+		if chk != nil {
+			return chk.minTime()
 		}
 	}
-	return chk.minTime()
+	return math.MinInt64
 }
 
 func (s *memSeries) maxTime() int64 {
-	chk := s.head()
-	if chk == nil {
+	if len(s.chunks) == 0 {
 		return math.MinInt64
-	} else {
-		return chk.maxTime()
 	}
+	for i := len(s.chunks) - 1; i >= 0; i-- {
+		if s.chunks[i] != nil {
+			return s.chunks[i].maxTime()
+		}
+	}
+	return math.MinInt64
 }
 
 // appendable checks whether the given sample is valid for appending to the series.
@@ -1999,43 +2004,27 @@ func (s *memSeries) appendable(t int64, v float64) error {
 	return nil
 }
 
-func (s *memSeries) chunk(id int) *memChunk {
-	ix := id - s.firstChunkID
-	if ix < 0 || ix >= len(s.chunks) {
-		return nil
-	}
-	return s.chunks[ix]
-}
-
-func (s *memSeries) chunkPos(id int) int {
-	ix := id - s.firstChunkID
-	if ix < 0 || ix >= len(s.chunks) {
-		return -1
-	}
-	return ix
-}
-
-func (s *memSeries) chunkID(pos int) int {
-	return pos + s.firstChunkID
-}
-
-func (s *memSeries) dropTail(cid int) (tail *memChunk, removed int) {
-	c := s.chunk(cid)
-	if c == nil {
-		return nil, 0
-	}
-	tail, removed = s.dropTail(c.nextCid)
-	if tail == nil {
-		if c.chunk == nil && c.stale == nil {
-			idx := s.chunkPos(cid)
-			s.chunks[idx] = nil
-			removed++
+func (s *memSeries) chunk(id int64) *memChunk {
+	low, high := 0, len(s.chunks)-1
+	for low <= high {
+		mid := (low + high) >> 1
+		if s.chunks[mid].cid == id {
+			return s.chunks[mid]
+		} else if s.chunks[mid].cid > id {
+			high = mid - 1
 		} else {
-			return c, removed
+			low = mid + 1
 		}
 	}
+	return nil
+}
 
-	return tail, removed
+func (s *memSeries) chunkID(pos int) int64 {
+	if len(s.chunks) > pos {
+		return s.chunks[pos].cid
+	} else {
+		return -1
+	}
 }
 
 // gc removes all chunks from the series that have not timestamp
@@ -2055,82 +2044,53 @@ func (s *memSeries) truncateChunkBefore(mint int64, force bool) (chunkRemoved in
 			c.app = nil
 		}
 	}
-	var actualTail *memChunk
-	actualTail, chunkRemoved = s.dropTail(s.headCid)
 
-	var k int
-	for _, chk := range s.chunks {
-		if chk != nil {
-			break
+	for i, rlen := 0, len(s.chunks); i < rlen; i++ {
+		j := i - (rlen - len(s.chunks))
+		c := s.chunks[j]
+		if c == nil || c.stale == nil && c.chunk == nil {
+			s.chunks = append(s.chunks[:j], s.chunks[j+1:]...)
+			chunkRemoved++
 		}
-		k++
 	}
 
-	if k != 0 {
-		s.chunks = append(s.chunks[:0], s.chunks[k:]...)
-		if len(s.chunks)*3/2 < cap(s.chunks) {
-			dest := make([]*memChunk, len(s.chunks))
-			copy(dest, s.chunks[:])
-			s.chunks = dest
-		}
-		s.firstChunkID += k
+	if len(s.chunks)*3/2 < cap(s.chunks) && cap(s.chunks) > 4 {
+		dest := make([]*memChunk, len(s.chunks))
+		copy(dest, s.chunks)
+		s.chunks = dest
 	}
-
-	if actualTail == nil {
+	if len(s.chunks) == 0 {
 		return chunkRemoved, math.MaxInt64
 	} else {
-		return chunkRemoved, actualTail.minTime()
+		return chunkRemoved, s.minTime()
 	}
 }
 
-func (s *memSeries) addChunk(c *memChunk) int {
-	s.chunks = append(s.chunks, c)
-	return s.chunkID(len(s.chunks) - 1)
-}
-
-func (s *memSeries) getOrCreateChunk(border uint32) (*memChunk, bool) {
-	head := s.chunk(s.headCid)
-	if head == nil || head.borderTime < border {
-		fresh := &memChunk{borderTime: border, nextCid: s.headCid}
-		freshCid := s.addChunk(fresh)
-
-		s.headCid = freshCid
-		return fresh, true
-	} else if head.borderTime == border {
-		return head, false
-	}
-
-	for c := s.chunk(s.headCid); c != nil; {
-		if c.borderTime == border {
-			return c, false
-		} else if c.borderTime > border {
-			nextChk := s.nextChunk(c)
-			// insert memChunk at head/mid
-			if nextChk == nil || nextChk.borderTime < border {
-				fresh := &memChunk{borderTime: border, nextCid: c.nextCid}
-				freshCid := s.addChunk(fresh)
-
-				c.nextCid = freshCid
-				return fresh, true
-			}
+func (s *memSeries) getOrCreateChunk(cid int64) (*memChunk, bool) {
+	cid = cid & MaxMemoryChuckId
+	idx, size := 0, len(s.chunks)
+	for i := size - 1; i >= 0; i-- {
+		if s.chunks[i].cid == cid {
+			return s.chunks[i], false
+		} else if s.chunks[i].cid < cid {
+			idx = i + 1
+			break
 		}
-		c = s.chunk(c.nextCid)
 	}
 
-	panic("appending pos not found ")
-}
-
-func (s *memSeries) nextChunk(chk *memChunk) *memChunk {
-	if chk.nextCid == -1 {
-		return nil
+	if idx == size {
+		s.chunks = append(s.chunks, new(memChunk))
 	} else {
-		return s.chunk(chk.nextCid)
+		s.chunks = append(s.chunks[:idx+1], s.chunks[idx:]...)
+		s.chunks[idx] = new(memChunk)
 	}
+	s.chunks[idx].cid = cid
+	return s.chunks[idx], true
 }
 
 // append adds the sample (t, v) to the series.
 func (s *memSeries) append(t int64, v float64) (success, chunkCreated bool) {
-	c, chunkCreated := s.getOrCreateChunk(uint32(t / chunkenc.ChunkWindowMs))
+	c, chunkCreated := s.getOrCreateChunk(t / chunkenc.ChunkWindowMs)
 	if chunkCreated {
 		if len(s.chunks) > 80 {
 			fmt.Printf("%v chunk is large %d now:%d,first border:%d\n", s.lset.String(), len(s.chunks), time.Now().Unix(), s.chunks[0].borderTime)
@@ -2177,7 +2137,7 @@ func computeChunkEndTime(start, cur, max int64) int64 {
 	return start + (max-start)/a
 }
 
-func (s *memSeries) iterator(id int, it chunkenc.Iterator) chunkenc.Iterator {
+func (s *memSeries) iterator(id int64, it chunkenc.Iterator) chunkenc.Iterator {
 	c := s.chunk(id)
 	// TODO(fabxc): Work around! A querier may have retrieved a pointer to a series' chunk,
 	// which got then garbage collected before it got accessed.
@@ -2201,7 +2161,7 @@ func (s *memSeries) iterator(id int, it chunkenc.Iterator) chunkenc.Iterator {
 		numSamples = c.chunk.NumSamples()
 	}
 
-	if s.encoding != chunkenc.EncXOR || id-s.firstChunkID < len(s.chunks)-1 {
+	if s.encoding != chunkenc.EncXOR || c.cid < s.head().cid {
 		return iter
 	}
 	// Serve the last 4 samples for the last chunk from the sample buffer
@@ -2222,7 +2182,15 @@ func (s *memSeries) iterator(id int, it chunkenc.Iterator) chunkenc.Iterator {
 }
 
 func (s *memSeries) head() *memChunk {
-	return s.chunk(s.headCid)
+	if len(s.chunks) == 0 {
+		return nil
+	}
+	for i := len(s.chunks) - 1; i >= 0; i-- {
+		if s.chunks[i] != nil {
+			return s.chunks[i]
+		}
+	}
+	return nil
 }
 
 type mutableChunk struct {
@@ -2252,7 +2220,7 @@ type memChunk struct {
 	stale      *mutableChunk
 	chunk      *mutableChunk
 	app        chunkenc.Appender
-	nextCid    int
+	cid        int64
 	borderTime uint32
 }
 
