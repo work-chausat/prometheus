@@ -635,7 +635,7 @@ func (db *MigratedDB) migratingBlock(uid ulid.ULID) (err error) {
 	level.Info(db.logger).Log("msg", "migrate starting", "uid", uid)
 	defer func(t time.Time) {
 		if db.Cold.exists(uid) {
-			db.DB.deleteBlock(uid)
+			db.DB.DeleteBlock(uid)
 		}
 		if err != nil {
 			level.Error(db.logger).Log("msg", "migrate failed", "uid", uid, "costTime", time.Since(t).String(), "err", err)
@@ -892,7 +892,7 @@ func (db *DB) exists(uid ulid.ULID) bool {
 	return false
 }
 
-func (db *DB) deleteBlock(uid ulid.ULID) error {
+func (db *DB) DeleteBlock(uid ulid.ULID) error {
 	blocks := make(map[ulid.ULID]*Block, 0)
 	db.mtx.Lock()
 	for i, block := range db.blocks {
