@@ -279,7 +279,7 @@ func TestReadIndexFormatV1(t *testing.T) {
 	     app.Add(labels.FromStrings("bar", strconv.FormatInt(int64(i), 10)), 0, 0)
 	   }
 	   app.Commit()
-	   db.Compact(false)
+	   db.CompactHead(false)
 	   db.Close()
 	*/
 

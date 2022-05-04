@@ -162,7 +162,7 @@ type DB struct {
 	// changing the autoCompact var.
 	autoCompactMtx sync.Mutex
 	autoCompact    bool
-
+	headCompactMtx sync.Mutex
 	// Cancel a running compaction when a shutdown is initiated.
 	compactCancel     context.CancelFunc
 	migrate           func(uid ulid.ULID)
@@ -170,19 +170,21 @@ type DB struct {
 }
 
 type dbMetrics struct {
-	loadedBlocks         prometheus.GaugeFunc
-	symbolTableSize      prometheus.GaugeFunc
-	reloads              prometheus.Counter
-	reloadsFailed        prometheus.Counter
-	compactionsFailed    prometheus.Counter
-	compactionsTriggered prometheus.Counter
-	compactionsSkipped   prometheus.Counter
-	sizeRetentionCount   prometheus.Counter
-	timeRetentionCount   prometheus.Counter
-	startTime            prometheus.GaugeFunc
-	tombCleanTimer       prometheus.Histogram
-	blocksBytes          prometheus.Gauge
-	maxBytes             prometheus.Gauge
+	loadedBlocks          prometheus.GaugeFunc
+	symbolTableSize       prometheus.GaugeFunc
+	reloads               prometheus.Counter
+	reloadsFailed         prometheus.Counter
+	compactionsFailed     prometheus.Counter
+	compactionsTriggered  prometheus.Counter
+	compactionsSkipped    prometheus.Counter
+	compactBlockTriggered prometheus.Counter
+	compactBlockFailed    prometheus.Counter
+	sizeRetentionCount    prometheus.Counter
+	timeRetentionCount    prometheus.Counter
+	startTime             prometheus.GaugeFunc
+	tombCleanTimer        prometheus.Histogram
+	blocksBytes           prometheus.Gauge
+	maxBytes              prometheus.Gauge
 }
 
 func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
@@ -234,16 +236,28 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Help:        "Total number of compactions that failed for the partition.",
 		ConstLabels: constLabels,
 	})
-	m.timeRetentionCount = prometheus.NewCounter(prometheus.CounterOpts{
-		Name:        "prometheus_tsdb_time_retentions_total",
-		Help:        "The number of times that blocks were deleted because the maximum time limit was exceeded.",
-		ConstLabels: constLabels,
-	})
 	m.compactionsSkipped = prometheus.NewCounter(prometheus.CounterOpts{
 		Name:        "prometheus_tsdb_compactions_skipped_total",
 		Help:        "Total number of skipped compactions due to disabled auto compaction.",
 		ConstLabels: constLabels,
 	})
+
+	m.compactBlockTriggered = prometheus.NewCounter(prometheus.CounterOpts{
+		Name:        "prometheus_tsdb_compact_block_triggered_total",
+		Help:        "number of triggered compact block",
+		ConstLabels: constLabels,
+	})
+	m.compactBlockFailed = prometheus.NewCounter(prometheus.CounterOpts{
+		Name:        "prometheus_tsdb_compact_block_failed_total",
+		Help:        "number of compact block",
+		ConstLabels: constLabels,
+	})
+	m.timeRetentionCount = prometheus.NewCounter(prometheus.CounterOpts{
+		Name:        "prometheus_tsdb_time_retentions_total",
+		Help:        "The number of times that blocks were deleted because the maximum time limit was exceeded.",
+		ConstLabels: constLabels,
+	})
+
 	m.startTime = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name:        "prometheus_tsdb_lowest_timestamp",
 		Help:        "Lowest timestamp value stored in the database. The unit is decided by the library consumer.",
@@ -286,6 +300,8 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.compactionsFailed,
 			m.compactionsTriggered,
 			m.compactionsSkipped,
+			m.compactBlockTriggered,
+			m.compactBlockFailed,
 			m.sizeRetentionCount,
 			m.timeRetentionCount,
 			m.startTime,
@@ -838,8 +854,9 @@ func (db *DB) Dir() string {
 func (db *DB) run() {
 	defer close(db.donec)
 
-	backoff := time.Duration(0)
+	go db.compactBlockTrigger()
 
+	backoff := time.Duration(0)
 	for {
 		select {
 		case <-db.stopc:
@@ -862,8 +879,10 @@ func (db *DB) run() {
 				if db.opts.ForceFlushResident {
 					forceFlush = time.Now().After(db.latestCompactTime.Add(time.Duration(db.head.chunkRange*4) * time.Millisecond))
 				}
-				if err := db.Compact(forceFlush); err != nil {
+				if err := db.CompactHead(forceFlush); err != nil {
 					level.Error(db.logger).Log("msg", "compaction failed", "err", err)
+
+					db.metrics.compactionsFailed.Inc()
 					backoff = exponential(backoff, 1*time.Second, 1*time.Minute)
 				} else {
 					backoff = 0
@@ -872,6 +891,23 @@ func (db *DB) run() {
 				db.metrics.compactionsSkipped.Inc()
 			}
 			db.autoCompactMtx.Unlock()
+		case <-db.stopc:
+			return
+		}
+	}
+}
+
+func (db *DB) compactBlockTrigger() {
+	for {
+		select {
+		case <-time.After(1 * time.Minute):
+			db.metrics.compactBlockTriggered.Inc()
+
+			if err := db.compactBlocks(); err != nil {
+				db.metrics.compactBlockFailed.Inc()
+
+				level.Error(db.logger).Log("msg", "compactBlocks failed", "err", err)
+			}
 		case <-db.stopc:
 			return
 		}
@@ -928,29 +964,23 @@ func (a dbAppender) Commit() error {
 	return err
 }
 
-// Compact data if possible. After successful compaction blocks are reloaded
+// CompactHead data if possible. After successful compaction blocks are reloaded
 // which will also trigger blocks to be deleted that fall out of the retention
 // window.
 // If no blocks are compacted, the retention window state doesn't change. Thus,
 // this is sufficient to reliably delete old data.
 // Old blocks are only deleted on Reload based on the new block's parent information.
 // See DB.Reload documentation for further information.
-func (db *DB) Compact(forceCompact bool) (err error) {
-	db.cmtx.Lock()
-	defer db.cmtx.Unlock()
-	defer func() {
-		if err != nil {
-			db.metrics.compactionsFailed.Inc()
-		}
-	}()
+func (db *DB) CompactHead(forceFlush bool) (err error) {
+	db.headCompactMtx.Lock()
+	defer db.headCompactMtx.Unlock()
 
 	var (
 		mint, maxt int64
 	)
 	// Check whether we have pending head blocks that are ready to be persisted.
 	// They have the highest priority.
-
-	for i := 0; db.head.compactable() || forceCompact; i++ {
+	for i := 0; db.head.compactable() || forceFlush; i++ {
 		db.latestCompactTime = time.Now()
 		select {
 		case <-db.stopc:
@@ -1015,6 +1045,15 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 		}
 	}
 
+	return nil
+}
+
+// compactBlocks compacts all the eligible on-disk blocks.
+// The compaction mutex should be held before calling this method.
+func (db *DB) compactBlocks() (err error) {
+	db.cmtx.Lock()
+	defer db.cmtx.Unlock()
+
 	// Check for compactions of multiple blocks.
 	for {
 		plan, err := db.compactor.Plan(db.dir)
@@ -1043,16 +1082,7 @@ func (db *DB) Compact(forceCompact bool) (err error) {
 			}
 			return errors.Wrap(err, "Reload blocks")
 		}
-
-		if db.head.compactable() {
-			select {
-			case db.compactc <- struct{}{}:
-			default:
-			}
-			break
-		}
 	}
-
 	return nil
 }
 
@@ -1506,19 +1536,20 @@ func (db *DB) Snapshot(dir string, withHead bool) error {
 		return errors.Errorf("dir must not be a valid ULID")
 	}
 
-	db.cmtx.Lock()
-	defer db.cmtx.Unlock()
+	db.headCompactMtx.Lock()
+	defer db.headCompactMtx.Unlock()
 
 	db.mtx.RLock()
-	defer db.mtx.RUnlock()
-
 	for _, b := range db.blocks {
 		level.Info(db.logger).Log("msg", "snapshotting block", "block", b)
 
 		if err := b.Snapshot(dir); err != nil {
+			db.mtx.RUnlock()
 			return errors.Wrapf(err, "error snapshotting block: %s", b.Dir())
 		}
 	}
+	db.mtx.RUnlock()
+
 	if !withHead {
 		return nil
 	}

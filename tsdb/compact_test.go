@@ -1079,7 +1079,7 @@ func TestDeleteCompactionBlockAfterFailedReload(t *testing.T) {
 			// Do the compaction and check the metrics.
 			// Compaction should succeed, but the Reload should fail and
 			// the new block created from the compaction should be deleted.
-			testutil.NotOk(t, db.Compact(false))
+			testutil.NotOk(t, db.CompactHead(false))
 			testutil.Equals(t, 1.0, prom_testutil.ToFloat64(db.metrics.reloadsFailed), "'failed db Reload' count metrics mismatch")
 			testutil.Equals(t, 1.0, prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.ran), "`compaction` count metric mismatch")
 			testutil.Equals(t, 1.0, prom_testutil.ToFloat64(db.metrics.compactionsFailed), "`compactions failed` count metric mismatch")
