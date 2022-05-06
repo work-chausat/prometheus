@@ -141,11 +141,11 @@ func (c *XORChunk) iteratorWithCopyData(it Iterator) *xorIterator {
 
 // Iterator implements the Chunk interface.
 func (c *XORChunk) Iterator(it Iterator) Iterator {
-	//if PointsOutOfOrderMode {
-	return c.iteratorWithCopyData(it)
-	//} else {
-	//	return c.iterator(it)
-	//}
+	if PointsOutOfOrderMode {
+		return c.iteratorWithCopyData(it)
+	} else {
+		return c.iterator(it)
+	}
 }
 
 type xorAppender struct {
