@@ -567,6 +567,24 @@ func (db *MigratedDB) Close() error {
 	}
 }
 
+func (db *MigratedDB) UnitiveBlocks() []*Block {
+	if db.Cold == nil {
+		return db.DB.blocks
+	}
+
+	var combines []*Block
+
+	db.Cold.mtx.RLock()
+	combines = append(combines, db.Cold.blocks...)
+	db.Cold.mtx.RUnlock()
+
+	db.DB.mtx.RLock()
+	combines = append(combines, db.DB.blocks...)
+	db.DB.mtx.RUnlock()
+
+	return combines
+}
+
 func (db *MigratedDB) Querier(mint, maxt int64) (Querier, error) {
 	maxBlockTime := int64(math.MinInt64)
 	if db.Cold != nil && len(db.Cold.blocks) > 0 {
@@ -974,6 +992,7 @@ func (a dbAppender) Commit() error {
 func (db *DB) CompactHead(forceFlush bool) (err error) {
 	db.headCompactMtx.Lock()
 	defer db.headCompactMtx.Unlock()
+	defer db.recover(&err)
 
 	var (
 		mint, maxt int64
@@ -1053,6 +1072,7 @@ func (db *DB) CompactHead(forceFlush bool) (err error) {
 func (db *DB) compactBlocks() (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
+	defer db.recover(&err)
 
 	// Check for compactions of multiple blocks.
 	for {
@@ -1095,6 +1115,23 @@ func getBlock(allBlocks []*Block, id ulid.ULID) (*Block, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (db *DB) recover(errp *error) {
+	e := recover()
+	if e == nil {
+		return
+	}
+	if err, ok := e.(runtime.Error); ok {
+		// Print the stack trace but do not inhibit the running application.
+		buf := make([]byte, 64<<10)
+		buf = buf[:runtime.Stack(buf, false)]
+
+		level.Error(db.logger).Log("msg", "runtime panic in compact", "err", e, "stacktrace", string(buf))
+		*errp = fmt.Errorf("unexpected error: %s", err)
+	} else {
+		*errp = e.(error)
+	}
 }
 
 // Reload blocks and trigger head truncation if new blocks appeared.
