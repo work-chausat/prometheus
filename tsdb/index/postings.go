@@ -16,6 +16,7 @@ package index
 import (
 	"container/heap"
 	"encoding/binary"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"runtime"
 	"sort"
 	"strings"
@@ -251,6 +252,14 @@ func (p *MemPostings) Delete(deleted map[uint64]struct{}) {
 	}
 	p.mtx.RUnlock()
 
+	except := make([]uint64, 0, len(deleted))
+	for k := range deleted {
+		except = append(except, k)
+	}
+	sort.Slice(except, func(i, j int) bool {
+		return except[i] < except[j]
+	})
+
 	for _, n := range keys {
 		p.mtx.RLock()
 		vals = vals[:0]
@@ -261,35 +270,25 @@ func (p *MemPostings) Delete(deleted map[uint64]struct{}) {
 
 		// For each posting we first analyse whether the postings list is affected by the deletes.
 		// If yes, we actually reallocate a new postings list.
-		for _, l := range vals {
+		for _, v := range vals {
 			// Only lock for processing one postings list so we don't block reads for too long.
 			p.mtx.Lock()
 
-			found := false
-			for _, id := range p.m[n][l] {
-				if _, ok := deleted[id]; ok {
-					found = true
-					break
-				}
-			}
-			if !found {
-				p.mtx.Unlock()
-				continue
-			}
-			repl := make([]uint64, 0, len(p.m[n][l]))
-
-			for _, id := range p.m[n][l] {
-				if _, ok := deleted[id]; !ok {
-					repl = append(repl, id)
-				}
-			}
-			if len(repl) > 0 {
-				p.m[n][l] = repl
+			var repl []uint64
+			if p.ordered && len(p.m[n][v]) > 65535 {
+				repl = tsdbutil.ExceptSlice(p.m[n][v], except)
 			} else {
-				delete(p.m[n], l)
+				repl = tsdbutil.ExceptHash(p.m[n][v], deleted)
+			}
+
+			if len(repl) > 0 {
+				p.m[n][v] = repl
+			} else {
+				delete(p.m[n], v)
 			}
 			p.mtx.Unlock()
 		}
+
 		p.mtx.Lock()
 		if len(p.m[n]) == 0 {
 			delete(p.m, n)
