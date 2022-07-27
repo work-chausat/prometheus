@@ -14,11 +14,7 @@
 package tsdb
 
 import (
-	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/prometheus/pkg/labels"
 )
@@ -49,36 +45,4 @@ func CreateHead(samples []*MetricSample, chunkRange int64, logger log.Logger) (*
 		return nil, err
 	}
 	return head, nil
-}
-
-// CreateBlock creates a chunkrange block from the samples passed to it, and writes it to disk.
-func CreateBlock(samples []*MetricSample, dir string, mint, maxt int64, logger log.Logger) (string, error) {
-	chunkRange := maxt - mint
-	if chunkRange == 0 {
-		chunkRange = DefaultBlockDuration
-	}
-	if chunkRange < 0 {
-		return "", InvalidTimesError
-	}
-	head, err := CreateHead(samples, chunkRange, logger)
-	if err != nil {
-		return "", err
-	}
-
-	compactor, err := NewLeveledCompactor(context.Background(), nil, logger, DefaultOptions.BlockRanges, nil)
-	if err != nil {
-		return "", err
-	}
-
-	err = os.MkdirAll(dir, 0777)
-	if err != nil {
-		return "", err
-	}
-
-	ulid, err := compactor.Write(dir, head, mint, maxt, nil)
-	if err != nil {
-		return "", err
-	}
-
-	return filepath.Join(dir, ulid.String()), nil
 }

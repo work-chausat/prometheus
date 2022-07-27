@@ -105,6 +105,92 @@ type Options struct {
 	WarmUpDBOnOpening  bool
 	ForceFlushResident bool
 	WaterMarkCompact   WaterMark
+	DeleteIgnores      []DeleteIgnore
+}
+
+type DeleteIgnore struct {
+	Start DateExpr
+	End   DateExpr
+}
+
+// Returns true if the chunk overlaps [mint, maxt].
+func (r *DeleteIgnore) OverlapsClosedInterval(mint, maxt int64) bool {
+	minTime := time.Unix(mint/1000, (mint%1000)*int64(time.Millisecond))
+	maxTime := time.Unix(maxt/1000, (maxt%1000)*int64(time.Millisecond))
+	return r.Start.Before(maxTime) && r.End.After(minTime)
+}
+
+type DateExpr struct {
+	expr  string
+	year  int
+	month int
+	day   int
+}
+
+func NewDateExpr(expr string) DateExpr {
+	s := strings.Split(expr, "-")
+	if len(s) != 3 {
+		panic("date expr formatting error")
+	}
+	d := DateExpr{expr: expr}
+
+	//parse the year
+	if s[0] == "*" {
+		d.year = math.MinInt32
+	} else if year, err := strconv.ParseInt(s[0], 10, 0); err == nil {
+		d.year = int(year)
+	} else {
+		panic("date expr formatting error")
+	}
+
+	//parse the month
+	if s[1] == "*" {
+		d.month = math.MinInt32
+	} else if month, err := strconv.ParseInt(s[1], 10, 0); err == nil {
+		d.month = int(month)
+	} else {
+		panic("date expr formatting error")
+	}
+	//parse the day
+	if s[2] == "*" {
+		d.day = math.MinInt32
+	} else if day, err := strconv.ParseInt(s[2], 10, 0); err == nil {
+		d.day = int(day)
+	} else {
+		panic("date expr formatting error")
+	}
+
+	return d
+}
+
+func (e DateExpr) Before(t time.Time) bool {
+	if e.year != math.MinInt32 && e.year != t.Year() {
+		return e.year < t.Year()
+	}
+	if e.month != math.MinInt32 && e.month != int(t.Month()) {
+		return e.month < int(t.Month())
+	}
+
+	if e.day != math.MinInt32 && e.day != t.Day() {
+		return e.day < t.Day()
+	}
+
+	return true
+}
+
+func (e DateExpr) After(t time.Time) bool {
+	if e.year != math.MinInt32 && e.year != t.Year() {
+		return e.year > t.Year()
+	}
+	if e.month != math.MinInt32 && e.month != int(t.Month()) {
+		return e.month > int(t.Month())
+	}
+
+	if e.day != math.MinInt32 && e.day != t.Day() {
+		return e.day > t.Day()
+	}
+
+	return true
 }
 
 // Appender allows appending a batch of data. It must be completed with a
@@ -376,7 +462,7 @@ func (db *DBReadOnly) FlushWAL(dir string) error {
 		mint: mint,
 		maxt: maxt,
 	}
-	compactor, err := NewLeveledCompactor(context.Background(), nil, db.logger, DefaultOptions.BlockRanges, chunkenc.NewPool())
+	compactor, err := NewLeveledCompactor(context.Background(), nil, db.logger, DefaultOptions.BlockRanges, nil, chunkenc.NewPool())
 	if err != nil {
 		return errors.Wrap(err, "create leveled compactor")
 	}
@@ -531,6 +617,7 @@ func (db *DBReadOnly) Close() error {
 type MigratedDB struct {
 	*DB
 	Cold    *DB
+	Status  string     //loading、recover、running
 	wMutex  sync.Mutex //migrated lock
 	waiting sync.Map
 }
@@ -776,7 +863,7 @@ func OpenDB(name, dir string, l log.Logger, reg prometheus.Registerer, opts *Opt
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	db.compactor, err = NewLeveledCompactor(ctx, dispensableReg, l, opts.BlockRanges, db.chunkPool)
+	db.compactor, err = NewLeveledCompactor(ctx, dispensableReg, l, opts.BlockRanges, opts.DeleteIgnores, db.chunkPool)
 	if err != nil {
 		cancel()
 		return nil, errors.Wrap(err, "create leveled compactor")
@@ -959,6 +1046,21 @@ func (db *DB) DeleteBlock(uid ulid.ULID) error {
 	db.mtx.Unlock()
 
 	return db.deleteBlocks(blocks)
+}
+
+func (db *DB) UpdateBlockMeta(uid ulid.ULID, ignore bool) error {
+	db.mtx.Lock()
+	for _, block := range db.blocks {
+		if block.meta.ULID.Compare(uid) == 0 {
+			block.meta.DeleteIgnore = ignore
+			if _, err := writeMetaFile(block.logger, block.dir, &block.meta); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	db.mtx.Unlock()
+	return nil
 }
 
 // dbAppender wraps the DB's head appender and triggers compactions on commit
@@ -1315,6 +1417,10 @@ func (db *DB) beyondTimeRetention(blocks []*Block) (deletable map[ulid.ULID]*Blo
 		// the retention period so any blocks after that are added as deletable.
 		if i > 0 && blocks[0].Meta().MaxTime-block.Meta().MaxTime > int64(db.opts.RetentionDuration) {
 			for _, b := range blocks[i:] {
+				//ignore block retention forever
+				if b.meta.DeleteIgnore {
+					continue
+				}
 				deletable[b.meta.ULID] = b
 			}
 			db.metrics.timeRetentionCount.Inc()
@@ -1332,6 +1438,16 @@ func (db *DB) beyondSizeRetention(blocks []*Block) (deletable map[ulid.ULID]*Blo
 
 	deletable = make(map[ulid.ULID]*Block)
 
+	sort.Slice(blocks, func(i, j int) bool {
+		if blocks[i].Meta().DeleteIgnore == blocks[j].Meta().DeleteIgnore {
+			return blocks[i].Meta().MaxTime > blocks[j].Meta().MaxTime
+		} else if blocks[i].Meta().DeleteIgnore {
+			return true
+		} else {
+			return false
+		}
+	})
+
 	walSize, _ := db.Head().wal.Size()
 	// Initializing size counter with WAL size,
 	// as that is part of the retention strategy.
@@ -1341,6 +1457,9 @@ func (db *DB) beyondSizeRetention(blocks []*Block) (deletable map[ulid.ULID]*Blo
 		if blocksSize > db.opts.MaxBytes {
 			// Add this and all following blocks for deletion.
 			for _, b := range blocks[i:] {
+				if b.meta.DeleteIgnore {
+					continue
+				}
 				deletable[b.meta.ULID] = b
 			}
 			db.metrics.sizeRetentionCount.Inc()

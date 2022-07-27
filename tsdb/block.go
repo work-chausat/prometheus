@@ -146,9 +146,9 @@ type BlockMeta struct {
 
 	// Information on compactions the block was created from.
 	Compaction BlockMetaCompaction `json:"compaction"`
-
 	// Version of the index format.
-	Version int `json:"version"`
+	Version      int  `json:"version"`
+	DeleteIgnore bool `json:"delete_ignore,omitempty"`
 }
 
 // BlockStats contains stats about contents of a block.
@@ -161,9 +161,10 @@ type BlockStats struct {
 
 // BlockDesc describes a block by ULID and time range.
 type BlockDesc struct {
-	ULID    ulid.ULID `json:"ulid"`
-	MinTime int64     `json:"minTime"`
-	MaxTime int64     `json:"maxTime"`
+	ULID         ulid.ULID `json:"ulid"`
+	MinTime      int64     `json:"minTime"`
+	MaxTime      int64     `json:"maxTime"`
+	DeleteIgnore bool      `json:"ignore"`
 }
 
 // BlockMetaCompaction holds information about compactions a block went through.

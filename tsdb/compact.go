@@ -75,11 +75,12 @@ type Compactor interface {
 
 // LeveledCompactor implements the Compactor interface.
 type LeveledCompactor struct {
-	metrics   *compactorMetrics
-	logger    log.Logger
-	ranges    []int64
-	chunkPool chunkenc.Pool
-	ctx       context.Context
+	metrics       *compactorMetrics
+	logger        log.Logger
+	ranges        []int64
+	chunkPool     chunkenc.Pool
+	ctx           context.Context
+	deleteIgnores []DeleteIgnore
 }
 
 type compactorMetrics struct {
@@ -143,7 +144,7 @@ func newCompactorMetrics(r prometheus.Registerer) *compactorMetrics {
 }
 
 // NewLeveledCompactor returns a LeveledCompactor.
-func NewLeveledCompactor(ctx context.Context, r prometheus.Registerer, l log.Logger, ranges []int64, pool chunkenc.Pool) (*LeveledCompactor, error) {
+func NewLeveledCompactor(ctx context.Context, r prometheus.Registerer, l log.Logger, ranges []int64, ignores []DeleteIgnore, pool chunkenc.Pool) (*LeveledCompactor, error) {
 	if len(ranges) == 0 {
 		return nil, errors.Errorf("at least one range must be provided")
 	}
@@ -154,11 +155,12 @@ func NewLeveledCompactor(ctx context.Context, r prometheus.Registerer, l log.Log
 		l = log.NewNopLogger()
 	}
 	return &LeveledCompactor{
-		ranges:    ranges,
-		chunkPool: pool,
-		logger:    l,
-		metrics:   newCompactorMetrics(r),
-		ctx:       ctx,
+		ranges:        ranges,
+		chunkPool:     pool,
+		logger:        l,
+		metrics:       newCompactorMetrics(r),
+		ctx:           ctx,
+		deleteIgnores: ignores,
 	}, nil
 }
 
@@ -331,9 +333,10 @@ func splitByRange(ds []dirMeta, tr int64) [][]dirMeta {
 
 func compactBlockMetas(uid ulid.ULID, blocks ...*BlockMeta) *BlockMeta {
 	res := &BlockMeta{
-		ULID:        uid,
-		MinTime:     blocks[0].MinTime,
-		CompactTime: blocks[0].CompactTime,
+		ULID:         uid,
+		MinTime:      blocks[0].MinTime,
+		CompactTime:  blocks[0].CompactTime,
+		DeleteIgnore: blocks[0].DeleteIgnore,
 	}
 
 	sources := map[ulid.ULID]struct{}{}
@@ -342,6 +345,7 @@ func compactBlockMetas(uid ulid.ULID, blocks ...*BlockMeta) *BlockMeta {
 	maxt := int64(math.MinInt64)
 
 	for _, b := range blocks {
+		res.DeleteIgnore = res.DeleteIgnore || b.DeleteIgnore
 		if b.MaxTime > maxt {
 			maxt = b.MaxTime
 		}
@@ -474,12 +478,20 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 
 	entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
 	uid := ulid.MustNew(ulid.Now(), entropy)
+	deleteIgnore := false
+	for _, ignore := range c.deleteIgnores {
+		if ignore.OverlapsClosedInterval(mint, maxt) {
+			deleteIgnore = true
+			break
+		}
+	}
 
 	meta := &BlockMeta{
-		ULID:        uid,
-		MinTime:     mint,
-		MaxTime:     maxt,
-		CompactTime: time.Now().Unix(),
+		ULID:         uid,
+		MinTime:      mint,
+		MaxTime:      maxt,
+		CompactTime:  time.Now().Unix(),
+		DeleteIgnore: deleteIgnore,
 	}
 	meta.Compaction.Level = 1
 	meta.Compaction.Sources = []ulid.ULID{uid}
